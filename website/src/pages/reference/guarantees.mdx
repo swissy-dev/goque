@@ -1,0 +1,188 @@
+---
+title: Lifecycle & Guarantees
+description: The job state machine, and what goque promises about claiming, execution, crash recovery, ordering, and retention — with the reasoning behind each position.
+---
+
+# Lifecycle & Guarantees
+
+Every job queue makes promises. The useful ones also say what they *don't* promise, because that is the half you have to design around. This page is both.
+
+## The state machine
+
+A job moves through seven states, three of which are terminal:
+
+```
+                    ┌──────────────┐
+   enqueue ────────▶│  scheduled   │──── due ────┐
+   (with a delay)   └──────────────┘             │
+                                                 ▼
+   enqueue ──────────────────────────────▶ ┌───────────┐
+   (due now)                               │ available │
+                                           └───────────┘
+                                                 │ claim
+                                                 ▼
+                                           ┌───────────┐
+                       ┌───────────────────│  running  │───────────────────┐
+                       │                   └───────────┘                   │
+          ┌────────────┼────────────┐            │                         │
+          ▼            ▼            ▼            ▼                         ▼
+    ┌───────────┐ ┌─────────┐ ┌───────────┐ ┌────────────┐         ┌─────────────┐
+    │ completed │ │  dead   │ │ cancelled │ │ retryable  │──backoff│  available  │
+    └───────────┘ └─────────┘ └───────────┘ └────────────┘  elapsed└─────────────┘
+```
+
+**`scheduled`** — the job exists but its `ScheduledAt` has not arrived. This is where `WithDelay` and `WithScheduledAt` put a job. Nothing polls it directly; the mover promotes it once it comes due.
+
+**`available`** — due, and waiting for the next claim. This is the only state a worker can claim from.
+
+**`running`** — claimed, with an attempt executing. The claim stamped `AttemptedAt`, appended the claiming process to `AttemptedBy`, and incremented both `Attempt` and `Generation`. Only a running job can be finalized or heartbeated.
+
+**`retryable`** — the attempt did not succeed, or did not want to run yet, and the job is waiting for a new `ScheduledAt`. Three different things land here: a failure with attempts remaining, a `SnoozeFor`, and a rescue. It is not terminal — the mover promotes it back to `available` when its time arrives.
+
+**`completed`** — the worker returned `nil`. Terminal.
+
+**`cancelled`** — stopped deliberately rather than by failure, via `goque.Cancel(err)` from the worker. It will never run again regardless of how many attempts it had left, which is the entire point: cancel means *this work has become pointless*, not *this work failed*. Terminal.
+
+**`dead`** — the job used its last attempt without succeeding. Terminal, and retained with its error history rather than deleted, so a dead job is something you can go and read.
+
+The transitions, and what drives each:
+
+| From | To | Driver |
+| --- | --- | --- |
+| *(enqueue)* | `scheduled` / `available` | whether `ScheduledAt` is in the future |
+| `scheduled` | `available` | the mover, once due |
+| `available` | `running` | an exclusive claim by a worker |
+| `running` | `completed` | the worker returned `nil` |
+| `running` | `retryable` | a failure with attempts left, a `SnoozeFor`, or a rescue |
+| `running` | `dead` | a failure on the job's last attempt |
+| `running` | `cancelled` | the worker returned `goque.Cancel(err)` |
+| `retryable` | `available` | the mover, once the backoff elapses |
+| *(terminal)* | *(deleted)* | the cleaner, once past retention |
+
+Two things this diagram does *not* have:
+
+- **No path out of a terminal state.** A dead job is not automatically retried, and re-queueing one is a planned feature (see the [Roadmap](/reference/roadmap)).
+- **No way to cancel a job that has not started yet.** Cancellation today comes from inside a running worker.
+
+## Exclusive claiming
+
+**Exactly one worker gets any given job.** Not "usually one" — the claim is contractually atomic, and every backend has to prove it.
+
+`Fetch` is a single indivisible operation that selects due jobs *and* moves them to `running` *and* increments their counters. There is no window between "I saw this job" and "I took this job" for another worker to slip into.
+
+The in-memory backend does it under one mutex; a Postgres backend would do it with `FOR UPDATE SKIP LOCKED` in one statement. No leader election is involved, because electing a leader to hand out work would serialize the entire cluster through one process.
+
+The conformance suite in [`backendtest`](/reference/backends) runs ten goroutines racing to claim two hundred jobs and asserts that each job was delivered exactly once. A backend that gets this wrong does not pass.
+
+## Execution is at-least-once
+
+**Claiming is exactly-once. Execution is at-least-once.** Those are different sentences and the difference is the one thing to internalize.
+
+Consider a worker charging a credit card. It calls the payment gateway, the charge succeeds — and the process is killed a microsecond later, before it records that the job is done. The queue has no way to know the charge happened. The row still says `running`, its heartbeat goes stale, and the job is rescued and run again.
+
+No queue that survives crashes can avoid this. The side effect (the charge) and the bookkeeping (the job row) are two separate writes to two separate systems, and any process can die between them.
+
+A queue that claims otherwise has either moved the bookkeeping into your database — which is real, and which goque plans to offer through transactional backends — or is not telling you the truth.
+
+So: **write idempotent workers.** Give the outbound request an idempotency key. Check whether the invoice already has a PDF before rendering it. Use an upsert.
+
+In practice this is a small amount of work at the top of a worker, and it converts a whole category of 3am incidents into a no-op.
+
+:::warning[The window is small, but it is not zero]
+Under the fake and under `ProcessReady`, finalization happens immediately. Under a started client the completer batches finalizations, so the window between a side effect and its record reaching the backend is up to the flush interval. Small enough to ignore in most systems; not small enough to build correctness on.
+:::
+
+## Heartbeats and rescue
+
+If a worker process dies mid-job, the job is still sitting in `running` — claimed by a process that no longer exists. Something has to notice.
+
+Every client batch-heartbeats all of its in-flight jobs on a timer (`HeartbeatInterval`, 30s by default), stamping `HeartbeatAt` on each row.
+
+Separately, the rescuer looks for `running` jobs whose `HeartbeatAt` is older than `RescueTTL` — three heartbeat intervals by default, so 90s — and returns them to `retryable` with `ScheduledAt` set to now. The mover then makes them available, and the next claim picks them up as a fresh attempt.
+
+Rescue by heartbeat rather than by deadline is a deliberate choice. A fixed "rescue after 10 minutes" rule has to guess how long your jobs take, and it will eventually rescue a perfectly healthy job that was merely slow — running it twice for no reason.
+
+A heartbeat asks a different question: not *is this taking too long?* but *is anyone still there?* A four-hour report with a live worker heartbeating every 30 seconds is never rescued. A ten-second job whose process was OOM-killed is rescued in ninety.
+
+The same reasoning runs in the other direction. A client that fails to heartbeat three times in a row concludes that *it* is the isolated one: it cancels its running jobs' contexts and discards their results rather than writing them. Both sides of a network partition reach the same verdict about who owns the work.
+
+This is also why `Stop` keeps heartbeating for the whole drain. A client that stopped heartbeating while finishing its last jobs would look exactly like a dead one, and another process would rescue work that was seconds from completing.
+
+## Generation fencing
+
+Rescue creates a hazard. The old worker might not be dead — just unreachable. It is still running your job, and when the partition heals it will cheerfully report a result for an attempt that was reassigned minutes ago.
+
+Every finalizing transition is therefore a compare-and-set on `(id, generation, state = running)`. `Generation` rises on every claim and never falls, so the rescued execution's generation is stale and its write is rejected with `ErrStaleAttempt` instead of applied.
+
+The zombie cannot complete a job that a live worker is retrying, cannot mark it dead, and cannot reschedule it. Heartbeats are fenced the same way, so a stale executor also cannot keep a reclaimed job alive or mask the real owner's death.
+
+:::details[Why `Attempt` and `Generation` are separate counters]
+They look redundant. Both increment on every claim, so the obvious design is to use the attempt number as the fencing token and store one integer instead of two.
+
+That design breaks on snooze.
+
+`Attempt` is a **budget**: it is spent against `MaxAttempts`, and `SnoozeFor` explicitly hands it back, because snoozing means "not yet", not "I failed". A job that snoozes fifty times waiting for an upstream dependency should be no closer to dead than when it started.
+
+`Generation` is an **ownership token**: monotonic, never refunded, meaningless as a count.
+
+Collapse them and the refund becomes a security hole. A job is claimed at attempt 1, snoozes — attempt goes back to 0 — and is reclaimed at attempt 1 again. The same token has now been issued to two different executions.
+
+If the first one's snooze arrives late, perhaps because it was retrying against a slow backend, it matches the CAS and reschedules an execution that is *currently running*, moving a live job's schedule out from under it.
+
+Keeping `Generation` monotonic makes that impossible: the replayed snooze carries generation 1, the live execution holds generation 2, and the replay is rejected. The conformance suite tests exactly this case, because it is the kind of bug that surfaces once a quarter in production and never in development.
+:::
+
+## Ordering
+
+Within a queue, jobs are fetched in **effective time** order — `ScheduledAt` minus `PriorityBoost` — and ties are broken by ID.
+
+That is what makes priority a time boost rather than a rank. `WithPriority(3*time.Minute)` means "sort as though this had been enqueued three minutes earlier", and because a waiting job's effective age keeps growing on its own, a low-priority job cannot be starved: eventually its effective time is older than the boosted arrivals ahead of it.
+
+`PriorityAt` is recomputed whenever `ScheduledAt` changes — retry, snooze, rescue — so a boosted job keeps its advantage across retries instead of quietly losing it on the first failure.
+
+**There is no strict FIFO guarantee.** Fetch order is a bias, not a sequence. Ten workers claiming from one queue start ten jobs at once and finish them in whatever order the work takes, so two jobs enqueued a millisecond apart can complete in either order.
+
+If a job genuinely must not overlap with another, that is a serialization requirement, and cluster-wide concurrency keys are the planned feature for it — see the [Roadmap](/reference/roadmap). Today, the honest tool is to make the ordering explicit: have the first job enqueue the second.
+
+Across queues, order is arbitrary by design. Queue weights arbitrate *between* queues; priority boosts order jobs *within* one. See [Queues & Concurrency](/running/queues).
+
+## Retention
+
+Finalized jobs are not deleted immediately. The cleaner runs on `CleanInterval` (one minute by default) and deletes terminal jobs whose `FinalizedAt` is older than the retention for their state:
+
+| State | Default retention | Config field |
+| --- | --- | --- |
+| `completed` | 24 hours | `CompletedRetention` |
+| `cancelled` | 7 days | `CancelledRetention` |
+| `dead` | 7 days | `DeadRetention` |
+
+Completed jobs get a day because their value is short-lived: you want to answer "did the welcome email go out this morning?" and little else. Dead and cancelled jobs get a week because they are evidence — the ones you go looking for after a customer complaint.
+
+Retention is measured from `FinalizedAt`, so a job that failed for six hours before dying is kept for seven days *from its death*, not from when it was created.
+
+## Dead jobs
+
+A dead job is retained with its full error history: one `AttemptError` per failed attempt, each carrying the timestamp, the attempt number, the error message, and — if the attempt panicked — the stack trace captured at the panic. Read it with the backend's inspection helpers, or in a test with `f.Job(id).Errors`.
+
+:::note[Error history is uncapped today]
+The design calls for keeping the most recent attempts and trimming the rest. The current in-memory backend does not implement that trim: it appends every attempt error, so a job with `MaxAttempts: 25` that fails every time carries all twenty-five.
+
+That is fine at test and single-process scale; expect a cap when the durable backends land. Nothing in the API depends on the history being complete.
+:::
+
+Nothing moves a job out of `dead` on its own. Re-queueing dead jobs, and browsing them, arrive with the dead-letter tooling on the [Roadmap](/reference/roadmap).
+
+## What is not guaranteed
+
+Worth stating plainly, because the absence of a promise is easy to miss:
+
+- **Durability is the backend's property, not the library's.** goque never discards a job it acknowledged: non-terminal states are left only through fenced transitions or the rescuer, and the cleaner touches only terminal states. But surviving a power loss depends entirely on where the job is stored, and the in-memory backend stores it in a map — a restart loses everything. See [Backends](/reference/backends).
+- **Timeouts cancel contexts; they do not kill goroutines.** `WithTimeout` cancels the job's context at the deadline, and the executor then waits for `Work` to return. A worker that ignores `ctx.Done()` holds its slot until it finishes or the process dies. Respect your context.
+- **Exactly-once processing is not on offer today.** It requires finalizing the job inside the same transaction as your side effects, which requires a transactional backend. Planned, not built.
+
+## See also
+
+- **[Backends](/reference/backends)** — the contract that implements all of this, and the conformance suite.
+- **[Retries & Backoff](/configuration/retries)** — attempt budgets and the policies that schedule them.
+- **[Starting & Stopping](/running/lifecycle)** — draining without dropping work.
+- **[Roadmap](/reference/roadmap)** — transactional enqueue, remote cancellation, and the dead-letter browser.

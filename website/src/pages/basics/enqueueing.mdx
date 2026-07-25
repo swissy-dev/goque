@@ -1,0 +1,165 @@
+---
+title: Enqueueing Jobs
+description: Handing work to the queue — single inserts, batches in one round trip, calling it from an HTTP handler, and what the result tells you.
+---
+
+# Enqueueing Jobs
+
+Enqueueing is the point of the whole library. Everything else — workers, queues, retries — exists so that this one line can return immediately:
+
+```go
+res, err := client.Enqueue(ctx, ResizeImage{ImageID: "img_1", Width: 800})
+```
+
+The call stores the job and comes back. It does not run the worker, does not wait for it, and does not care whether a worker is even available right now. Your request handler is free to finish, and the resize happens on somebody else's time.
+
+That is worth stating plainly because it is the entire value proposition. A user who uploads a photo should get a response in the time it takes to write a row, not in the time it takes to resize an image. `Enqueue` is where that trade is made.
+
+## What you get back
+
+`Enqueue` returns an `*EnqueueResult`, whose `Job` field is the stored row — including the ID the backend assigned it and the queue, schedule, and retry settings that the [option layers](/configuration/options) resolved to:
+
+```go
+res, err := client.Enqueue(ctx, ResizeImage{ImageID: "img_1", Width: 800})
+if err != nil {
+	return fmt.Errorf("queue resize: %w", err)
+}
+
+slog.Info("queued resize",
+	"job_id", res.Job.ID,
+	"queue", res.Job.Queue,
+	"run_at", res.Job.ScheduledAt,
+)
+```
+
+Hold on to `res.Job.ID` when you want to correlate a request with the work it created — logged at enqueue and again by the worker, it turns "the email never arrived" into a single query.
+
+The other field, `Skipped`, reports that the backend deduplicated the insert instead of storing a new job.
+
+:::note
+`Skipped` is always `false` today. Nothing deduplicates yet — the field is there so that [unique jobs](/reference/roadmap), when they land, do not change the shape of this API. You can safely ignore it for now.
+:::
+
+Errors from `Enqueue` are storage or validation failures. Two of them you can trigger from your own code:
+
+- Options that contradict each other — `WithDelay` together with `WithScheduledAt` — wrap `backend.ErrConflictingOptions`.
+- Metadata that is not a JSON object wraps `backend.ErrInvalidMetadata`.
+
+Both are programmer errors that surface on the first call.
+
+## Where to call it from
+
+An HTTP handler is the canonical case: do the small synchronous thing, queue the slow thing, respond.
+
+```go [handler.go]
+func (h *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	var req signupRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		http.Error(w, "bad request", http.StatusBadRequest)
+		return
+	}
+
+	userID, err := h.users.Create(r.Context(), req.Email)
+	if err != nil {
+		http.Error(w, "could not create user", http.StatusInternalServerError)
+		return
+	}
+
+	if _, err := h.queue.Enqueue(r.Context(), SendWelcomeEmail{UserID: userID}); err != nil {
+		slog.Error("could not queue welcome email", "user_id", userID, "err", err)
+	}
+
+	w.WriteHeader(http.StatusCreated)
+	json.NewEncoder(w).Encode(map[string]string{"id": userID})
+}
+```
+
+Two decisions in there are worth copying.
+
+**Pass the request's context.** `r.Context()` is cancelled when the client disconnects, which is the behavior you want for the *insert* — a request nobody is waiting for should not keep writing rows. It does not follow the job into execution; the worker gets its own context from the executor.
+
+**Decide whether a failed enqueue fails the request.** Above, the signup succeeds even if the welcome email could not be queued — losing an email is better than losing a user account. For an order confirmation you would make the opposite call and return a 500. Either is defensible; the point is that it is a decision, not a default.
+
+:::warning[Enqueue is not part of your transaction]
+`Enqueue` writes through the backend on its own. If you enqueue inside a database transaction that later rolls back, the job survives and runs against data that never existed — the classic dual-write problem.
+
+For now, enqueue *after* your transaction commits and accept that a crash in between loses the job. Transactional enqueue (`EnqueueTx`), which commits the job atomically with your business data, is designed but arrives with the database backends. See the [Roadmap](/reference/roadmap).
+:::
+
+Handlers built this way are also pleasant to test: assert that the handler returned fast and queued the right job, separately from asserting that the worker does the right thing. [Testing Patterns](/testing/patterns) shows that two-phase shape.
+
+## Enqueueing in bulk
+
+Inserting jobs one at a time in a loop means one backend round trip per job. When you already have the whole set — a nightly batch, a fan-out across an account's images, a re-render of every invoice for a month — `EnqueueMany` sends them together:
+
+```go
+params := make([]goque.InsertParams, 0, len(sizes))
+for _, width := range sizes {
+	params = append(params, goque.InsertParams{
+		Args: ResizeImage{ImageID: imageID, Width: width},
+	})
+}
+
+results, err := client.EnqueueMany(ctx, params)
+```
+
+Each `InsertParams` carries its own `Args` and, optionally, its own `Opts` — so a batch is not forced to be uniform. Here the thumbnails go to the default queue and the expensive full-resolution render is pushed to `bulk`:
+
+```go
+results, err := client.EnqueueMany(ctx, []goque.InsertParams{
+	{Args: ResizeImage{ImageID: "img_1", Width: 400}},
+	{Args: ResizeImage{ImageID: "img_1", Width: 800}},
+	{Args: ResizeImage{ImageID: "img_1", Width: 4096},
+		Opts: []goque.EnqueueOption{goque.WithQueue("bulk")}},
+})
+```
+
+You get one result per entry, **in the order you passed them**, so `results[2].Job.ID` is the ID of the 4096px job.
+
+The batch is validated as a unit: goque builds every row before sending any of them, so one entry with contradictory options fails the whole call without storing the others. There is no partial batch to reconcile.
+
+`Enqueue` itself is a one-element `EnqueueMany` underneath, which is why the two behave identically in every other respect.
+
+## Tagging jobs as they are inserted
+
+Some things belong on every job and none of your call sites should have to remember them — the tenant a request belonged to, a trace ID, the version of the code that queued it. Insert-side middleware runs on the way to the backend and can write onto the rows before they are stored:
+
+```go
+func tenantTagger(next goque.EnqueueFunc) goque.EnqueueFunc {
+	return func(ctx context.Context, jobs []*goque.JobRow) error {
+		for _, j := range jobs {
+			j.Metadata = tagWithTenant(ctx, j.Metadata)
+		}
+		return next(ctx, jobs)
+	}
+}
+```
+
+Install it as `Config.EnqueueMiddleware` and it applies to every insert, single or batch.
+
+Worker-side middleware can then read that metadata back and put it into the context before your typed `Work` runs — which is how request-scoped information crosses the gap between the process that created the job and the one that runs it. [Middleware](/running/middleware) covers both chains.
+
+## Controlling when and where
+
+Every enqueue accepts options, applied in order and resolved over the job kind's defaults and the client's. The three you will reach for first:
+
+```go
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_1"},
+	goque.WithDelay(24*time.Hour),   // not before tomorrow
+	goque.WithQueue("email"),        // on the email queue
+	goque.WithPriority(time.Minute), // sorted as if queued a minute earlier
+)
+```
+
+- **`WithDelay`** is the one that turns a queue into a scheduler: "send this reminder tomorrow", "retry this import in an hour", "expire this hold in fifteen minutes".
+- **`WithQueue`** puts the job somewhere other than its default — and the queue does not have to be one this client works, so an enqueue-only process can feed a queue only the workers consume.
+- **`WithPriority`** is a *time boost* rather than a rank, which is why it takes a duration.
+
+There are more — timeouts, attempts, retry policy, metadata, absolute scheduling — and they all resolve through the same three layers. [Job Options](/configuration/options) has the complete set, and [Scheduling & Priority](/configuration/scheduling) covers delay and priority in depth.
+
+## Next steps
+
+- **[Job Options](/configuration/options)** — every per-enqueue option and how the layers resolve.
+- **[Scheduling & Priority](/configuration/scheduling)** — delays, absolute times, and the time-boost model.
+- **[Middleware](/running/middleware)** — tagging jobs at insert, and wrapping them at execution.
+- **[Testing Patterns](/testing/patterns)** — testing the handler that enqueues and the worker that runs it.

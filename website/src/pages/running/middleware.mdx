@@ -1,0 +1,303 @@
+---
+title: Middleware
+description: Wrap every job execution and every insert — logging, metrics, tracing, panic recovery — with net/http-shaped middleware.
+---
+
+# Middleware
+
+Every job in your application probably needs the same handful of things around it: a log line when it starts, a timer, a tracing span, the tenant ID pulled out of the request that created it. Writing that into each worker is how workers stop being about your domain.
+
+goque has two middleware chains for exactly this, both shaped like the `net/http` middleware you already know: a function that receives the next step and returns a replacement.
+
+| Chain | Type | Wraps | Installed with |
+| --- | --- | --- | --- |
+| Worker-side | `goque.Middleware` over `goque.WorkFunc` | Every attempt of every job | `Config.WorkerMiddleware` |
+| Insert-side | `goque.EnqueueMiddleware` over `goque.EnqueueFunc` | Every insert, including batches | `Config.EnqueueMiddleware` |
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues:  map[string]goque.QueueConfig{"default": {Concurrency: 10}},
+	WorkerMiddleware: []goque.Middleware{
+		middleware.Logger(slog.Default()),
+		middleware.Recovery(),
+	},
+	EnqueueMiddleware: []goque.EnqueueMiddleware{tagTenant},
+})
+```
+
+## The first entry is outermost
+
+Get this backwards and everything else on this page misleads you, so it comes first.
+
+:::warning[Order is outside-in]
+**The first middleware in the slice is the outermost wrapper.** It runs first on the way in and last on the way out. The last entry sits innermost, closest to your worker.
+
+It is the same convention as `net/http` router middleware — and the same one people get backwards there.
+:::
+
+```go
+WorkerMiddleware: []goque.Middleware{
+	middleware.Logger(slog.Default()), // outermost: runs first, returns last
+	middleware.Hooks(metricsHooks),
+	tenantContext,
+	middleware.Recovery(),             // innermost: runs last, returns first
+},
+```
+
+Which nests like this:
+
+```
+Logger ─┬─ Hooks ─┬─ tenantContext ─┬─ Recovery ─┬─ your Work
+        │         │                 │            │
+        └─────────┴─────────────────┴────────────┴─ error travels back out
+```
+
+Two consequences follow, and they are the whole reason ordering matters:
+
+**Anything that must *observe* an outcome belongs early in the slice.** `Logger` can only log an error that is returned to it. Put it after something that swallows errors and it will log success.
+
+**Anything that must *change the environment* the worker runs in belongs late.** A middleware that puts a tenant on the context has to be inside anything that wants to read it — but outside `Work` itself.
+
+## The shipped middleware
+
+Four are provided in `github.com/swissy-dev/goque/middleware`.
+
+### Logger
+
+```go
+middleware.Logger(slog.Default())
+```
+
+One info line when a job starts, one when it finishes, or an error line when it fails — each with the job's kind, queue, ID, and attempt, and the finishing ones with a duration. It is the fastest way to see anything at all, and goque itself logs almost nothing per job. See [Observability](/running/observability).
+
+### Hooks
+
+```go
+middleware.Hooks(middleware.HookFuncs{
+	Before: func(ctx context.Context, row *goque.JobRow) { /* ... */ },
+	After:  func(ctx context.Context, row *goque.JobRow, d time.Duration, err error) { /* ... */ },
+})
+```
+
+The metrics and tracing seam: a callback either side of the execution, with the duration and the error. Either field may be nil. The callbacks run on the job's own goroutine, so keep them quick.
+
+:::note
+`After` receives control errors like `goque.SnoozeFor` as errors, because at that point in the chain the outcome has not been decided. A snoozed job is not a failed one — if your metrics count "err != nil" as failure, a job that politely waits for a dependency will show up as an error rate.
+:::
+
+### Recovery
+
+```go
+middleware.Recovery() // goes LAST in the slice
+```
+
+This one deserves its own section, below.
+
+### Timeout
+
+```go
+middleware.Timeout()
+```
+
+:::warning[You almost certainly do not need this]
+**`Timeout()` is redundant inside a client.** The executor already applies the job's `goque.WithTimeout` deadline to the context *before* the middleware chain starts running. Installing this middleware simply nests a second, identical deadline inside the first.
+
+It exists for chains you assemble and drive yourself, and for the narrow case of restarting the clock at a point in the chain so that time spent in outer middleware does not count against the worker. In a normal `Config.WorkerMiddleware` it is a no-op that looks like a safety feature.
+:::
+
+If you want to *read* a job's timeout rather than apply it — to log it, or to budget an inner call against it — there is a helper:
+
+```go
+if d, ok := goque.JobTimeout(job); ok {
+	slog.Debug("job has a deadline", "kind", job.Kind, "timeout", d)
+}
+```
+
+## Recovery goes last
+
+Your process is never at risk from a panicking job. The executor recovers panics on its own, records the attempt with its stack trace, and retries the job under its normal policy. `middleware.Recovery()` is not what keeps you alive.
+
+What it changes is **position** — and therefore what your other middleware get to see.
+
+A panic unwinds. It does not return through `next`, it blows past it. So without an inner `Recovery`, a panic in your worker goes straight past every middleware wrapped around it, and every line of code those middleware would have run *after* `next` is skipped:
+
+```go
+// Without Recovery: this never runs when the job panics.
+func timed(m Metrics) goque.Middleware {
+	return func(next goque.WorkFunc) goque.WorkFunc {
+		return func(ctx context.Context, job *goque.JobRow) error {
+			start := time.Now()
+			err := next(ctx, job)                             // ← panic unwinds here
+			m.Timing(job.Kind, time.Since(start), err != nil) // ← skipped
+			return err
+		}
+	}
+}
+```
+
+The failure that most deserves a log line and a metric is precisely the one that gets neither. Your dashboard shows a job that started and never finished, with no error anywhere.
+
+Putting `Recovery()` **last in the slice** puts it innermost, closest to your worker, so it catches the panic and converts it into a returned error *inside* the chain. Now `Logger` logs it, `Hooks.After` fires with it, your timer records it. Everything outside sees an ordinary failure, because by the time it gets there, it is one.
+
+```go
+WorkerMiddleware: []goque.Middleware{
+	middleware.Logger(slog.Default()),
+	middleware.Hooks(metricsHooks),
+	middleware.Recovery(), // last: innermost, so the two above still observe panics
+},
+```
+
+### You do not trade reporting for position
+
+The natural worry is that catching the panic early means goque no longer sees it as a panic — that you get a log line and lose the stack trace and the `PanicHandler` call.
+
+You don't. `Recovery()` returns a `*goque.PanicError` carrying the recovered value and the stack, and the executor recognizes that type with `errors.As`. So the attempt is still recorded with its stack, `Config.PanicHandler` is still invoked, and your error reporting is exactly as it was — plus the middleware output you were missing.
+
+That is also the rule for writing your own:
+
+```go
+func recoveryWithMetrics(m Metrics) goque.Middleware {
+	return func(next goque.WorkFunc) goque.WorkFunc {
+		return func(ctx context.Context, job *goque.JobRow) (err error) {
+			defer func() {
+				if r := recover(); r != nil {
+					m.Panicked(job.Kind)
+					err = &goque.PanicError{Recovered: r, Stack: debug.Stack()}
+				}
+			}()
+			return next(ctx, job)
+		}
+	}
+}
+```
+
+:::danger
+Return `*goque.PanicError`, not an error of your own. A recovery middleware that returns `fmt.Errorf("panic: %v", r)` silently disables your `PanicHandler` and drops the stack trace from the attempt record — the two things you most want when a job panics.
+:::
+
+## Writing worker-side middleware
+
+The signature is the whole API. A middleware receives a `goque.WorkFunc` and returns one:
+
+```go
+type Metrics interface {
+	Timing(kind string, d time.Duration, failed bool)
+	Panicked(kind string)
+}
+
+func timed(m Metrics) goque.Middleware {
+	return func(next goque.WorkFunc) goque.WorkFunc {
+		return func(ctx context.Context, job *goque.JobRow) error {
+			start := time.Now()
+			err := next(ctx, job)
+			m.Timing(job.Kind, time.Since(start), err != nil)
+			return err
+		}
+	}
+}
+```
+
+Note what `job` is here: a `*goque.JobRow`, the untyped stored row. Middleware sits above the generic layer — decoding `Payload` into your worker's argument struct happens at the very end of the chain — so one middleware covers every job kind you have.
+
+You get `Kind`, `Queue`, `ID`, `Attempt`, `MaxAttempts`, `Metadata`, and the error history without knowing anything about the payload.
+
+Middleware wraps **each attempt**, not each job. A job on its fourth try runs the chain for the fourth time, with `job.Attempt` at 4.
+
+## Writing insert-side middleware
+
+The insert chain runs when jobs are created, and its job is almost always the same one: moving request-scoped context onto the row, where the worker can still find it hours later.
+
+This is the canonical use, because it is the one thing a worker cannot do for itself. The HTTP request that enqueued the job is long gone by the time the job runs; whatever you did not write down is lost.
+
+```go
+type ctxKey string
+
+const tenantKey ctxKey = "tenant"
+
+func tagTenant(next goque.EnqueueFunc) goque.EnqueueFunc {
+	return func(ctx context.Context, jobs []*goque.JobRow) error {
+		tenant, ok := ctx.Value(tenantKey).(string)
+		if !ok {
+			return next(ctx, jobs)
+		}
+		for _, job := range jobs {
+			job.Metadata = withTenant(job.Metadata, tenant)
+		}
+		return next(ctx, jobs)
+	}
+}
+
+func withTenant(meta []byte, tenant string) []byte {
+	fields := map[string]json.RawMessage{}
+	if len(meta) > 0 {
+		if err := json.Unmarshal(meta, &fields); err != nil {
+			return meta
+		}
+	}
+	encoded, err := json.Marshal(tenant)
+	if err != nil {
+		return meta
+	}
+	fields["tenant"] = encoded
+	out, err := json.Marshal(fields)
+	if err != nil {
+		return meta
+	}
+	return out
+}
+```
+
+The parameter is a **slice**: the chain is called once per `Enqueue` or `EnqueueMany` call, with the whole batch, so tagging is a loop. Rows arrive fully built — queue, schedule, retry policy and all resolved — so this is your last chance to change what gets stored.
+
+:::note
+Merge into `Metadata`, don't replace it. It must encode a JSON object, and goque reserves the `"goque"` key of that object for its own bookkeeping — the job's timeout lives there. Unmarshalling into a map and re-marshalling, as above, preserves it. Overwriting `Metadata` wholesale with your own object does not.
+:::
+
+Now the worker side can read the tag back and put it where your domain code expects it:
+
+```go
+func tenantContext(next goque.WorkFunc) goque.WorkFunc {
+	return func(ctx context.Context, job *goque.JobRow) error {
+		var meta struct {
+			Tenant string `json:"tenant"`
+		}
+		if len(job.Metadata) > 0 {
+			if err := json.Unmarshal(job.Metadata, &meta); err != nil {
+				return next(ctx, job)
+			}
+		}
+		if meta.Tenant != "" {
+			ctx = context.WithValue(ctx, tenantKey, meta.Tenant)
+		}
+		return next(ctx, job)
+	}
+}
+```
+
+Put the pair together and a trace ID, a tenant, or a locale set on the request context survives the trip through the queue, and every worker gets it without a line of per-worker code. The same shape carries a trace ID: stamp it on insert, read it on execution, start the span linked to the original request.
+
+## A production chain
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues:  map[string]goque.QueueConfig{"default": {Concurrency: 10}},
+	WorkerMiddleware: []goque.Middleware{
+		middleware.Logger(slog.Default()), // outermost: sees every outcome
+		timed(metrics),                    // times everything below it
+		tenantContext,                     // enriches ctx for the worker
+		middleware.Recovery(),             // innermost: panics become errors here
+	},
+	EnqueueMiddleware: []goque.EnqueueMiddleware{tagTenant},
+})
+```
+
+Read it top to bottom as outside-in and it says what it does: log everything, time everything, give the worker its tenant, and never let a panic escape past the first two.
+
+## Next steps
+
+- **[Observability](/running/observability)** — logging, metrics hooks, and error reporting in depth.
+- **[Error Handling](/configuration/errors)** — control errors, `ErrorHandler`, and `PanicHandler`.
+- **[Workers](/basics/workers)** — what sits at the end of the chain.
+- **[Testing Jobs](/testing)** — your real middleware runs in tests too.

@@ -1,0 +1,231 @@
+---
+title: Job Options
+description: Every goque knob is per job — how queue, priority, retries, timeouts, and metadata resolve from the enqueue call, the job kind, and the client.
+---
+
+# Job Options
+
+Most queue libraries freeze their settings somewhere inconvenient. Retry policy belongs to the worker, timeout belongs to the queue, priority belongs to a number you picked at deploy time.
+
+Then the day comes when one invoice needs ten attempts and a thirty-minute ceiling while the thousand routine ones behind it are fine with the defaults — and your only move is to define a second job type that does the same work.
+
+In goque there is one place all of this lives, and it is the job. Queue, priority, schedule, attempt budget, backoff curve, timeout, metadata: every one of them resolves for each individual job.
+
+```go
+client.Enqueue(ctx, GenerateInvoice{InvoiceID: "in_4471"},
+	goque.WithQueue("billing"),
+	goque.WithMaxAttempts(10),
+	goque.WithTimeout(30*time.Second),
+)
+```
+
+You will rarely write all three. Most enqueues carry no options at all, because the sensible value came from somewhere else.
+
+## Three layers, most specific first
+
+An option can be set in three places, and they resolve in this order:
+
+1. **The enqueue call** — `EnqueueOption` values passed to `Enqueue` or `EnqueueMany`.
+2. **The job kind** — an optional `JobOptions()` method on the args type.
+3. **The client** — `Config.Defaults`, plus the library's own fallbacks.
+
+Whichever layer sets a field first, going down that list, wins. Here is all three at once. The client sets a house style:
+
+```go [main.go]
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Defaults: goque.JobOptions{
+		MaxAttempts: 10,
+		RetryPolicy: goque.Exponential{Base: 5 * time.Second, Max: 30 * time.Minute, Jitter: 0.2},
+		Timeout:     time.Minute,
+	},
+})
+```
+
+The `ResizeImage` kind knows things the client does not — image work belongs on its own queue, it is slower than a minute, and a broken upload is not worth ten attempts:
+
+```go [jobs.go]
+type ResizeImage struct {
+	ImageID string `json:"image_id"`
+	Width   int    `json:"width"`
+}
+
+func (ResizeImage) Kind() string { return "image.resize" }
+
+func (ResizeImage) JobOptions() goque.JobOptions {
+	return goque.JobOptions{
+		Queue:       "images",
+		MaxAttempts: 5,
+		Timeout:     2 * time.Minute,
+	}
+}
+```
+
+And this one enqueue knows something neither of them does — a 4096px source that has already failed twice today is not going to succeed on the fifth try:
+
+```go
+client.Enqueue(ctx, ResizeImage{ImageID: "img_9021", Width: 4096},
+	goque.WithMaxAttempts(2))
+```
+
+The job that lands in the backend has `Queue: "images"` and `Timeout: 2m` from the kind, `MaxAttempts: 2` from the enqueue, and the client's `Exponential` retry policy, because nothing more specific mentioned one. Each field resolves on its own; overriding one does not discard the rest.
+
+:::warning[Zero means "unset", not "off"]
+A field left at its zero value counts as unset and falls through to the next layer. That is what makes partial overrides work, but it also means a job kind cannot use `JobOptions()` to push a knob *back* to zero.
+
+If your client sets `Timeout: time.Minute`, a kind returning `Timeout: 0` inherits the minute rather than opting out of it. Leave the client default unset and set it per kind instead.
+:::
+
+## The option reference
+
+| Option | Effect |
+| --- | --- |
+| `WithQueue(name)` | Stores the job in queue `name`. |
+| `WithPriority(d)` | Sorts the job as if it had been enqueued `d` earlier. |
+| `WithDelay(d)` | Runs no earlier than `d` after the enqueue. |
+| `WithScheduledAt(t)` | Runs no earlier than `t`. |
+| `WithMaxAttempts(n)` | Total attempts, counting the first, before the job is dead. |
+| `WithRetryPolicy(p)` | Backoff curve applied between this job's attempts. |
+| `WithTimeout(d)` | Cancels the job's context `d` into each attempt. |
+| `WithMetadata(m)` | Attaches a JSON object to the job row. |
+| `WithVersion(v)` | Stamps an args schema version on the row. |
+
+Most of them do exactly what they say. The rest of this page is the handful that don't.
+
+### WithQueue
+
+The queue you name does not have to be one this client works. A web process with no `Queues` configured is enqueue-only — it can feed `images` and `billing` all day without ever running a job itself. See [The Client](/basics/client).
+
+### WithTimeout
+
+`WithTimeout(d)` cancels the job's `context.Context` `d` into the attempt. It does not kill the goroutine: Go has no way to do that, and goque does not pretend otherwise.
+
+The executor cancels the context and then keeps waiting for `Work` to return, so a worker that ignores `ctx` runs to completion regardless of its timeout. Pass the context through to your HTTP calls and database queries and the deadline does its job.
+
+The timeout travels with the job rather than with the process, so whichever worker picks it up applies the same bound. Middleware that needs to read it should use the accessor rather than digging through the row:
+
+```go
+if d, ok := goque.JobTimeout(row); ok {
+	// row was enqueued with WithTimeout(d)
+}
+```
+
+:::note
+You do not need `middleware.Timeout()` inside a normal client. The executor applies the job's deadline *before* the middleware chain runs, so installing it simply nests a second identical deadline. It exists for chains you drive yourself. See [Middleware](/running/middleware).
+:::
+
+### WithDelay and WithScheduledAt
+
+Both set the earliest time a job may run — one relative, one absolute — and they are mutually exclusive. Setting both fails the enqueue before anything is stored:
+
+```go
+_, err := client.Enqueue(ctx, SendTrialReminder{UserID: "u_8842"},
+	goque.WithDelay(time.Hour),
+	goque.WithScheduledAt(time.Now().Add(time.Hour)),
+)
+
+errors.Is(err, backend.ErrConflictingOptions) // true
+```
+
+The check runs against the *resolved* options, so a kind default that sets `Delay` plus a per-enqueue `WithScheduledAt` collides just as loudly as passing both at the call site. In a batch, one bad entry fails the whole `EnqueueMany` without storing any of it.
+
+[Scheduling & Priority](/configuration/scheduling) covers both options properly, along with `WithPriority`.
+
+### WithMaxAttempts and WithRetryPolicy
+
+`WithMaxAttempts(n)` counts the first run, so `WithMaxAttempts(3)` means one attempt and two retries. When they are used up, a failing job becomes **dead** rather than being deleted.
+
+`WithRetryPolicy(p)` sets the curve between them, and the policy is serialized onto the row so any process retrying the job applies the same backoff. [Retries & Backoff](/configuration/retries) has the built-in policies and the shape of each.
+
+### WithMetadata
+
+Metadata is arbitrary JSON stored alongside the job, for the context that isn't part of your payload: the tenant, the request ID, the trace parent, whoever pressed the button.
+
+```go
+client.Enqueue(ctx, ResizeImage{ImageID: "img_9021", Width: 800},
+	goque.WithMetadata([]byte(`{"tenant":"acme","request_id":"req_77"}`)))
+```
+
+It must encode a JSON **object**. An array, a string, or malformed bytes fail the enqueue with an error wrapping `backend.ErrInvalidMetadata` — this is a real check, not a documented convention:
+
+```go
+_, err := client.Enqueue(ctx, ResizeImage{ImageID: "img_9021"},
+	goque.WithMetadata([]byte(`["not","an","object"]`)))
+
+errors.Is(err, backend.ErrInvalidMetadata) // true
+```
+
+The `"goque"` key inside that object is reserved — the library keeps its own bookkeeping there, including the resolved timeout and the snooze count. Write anything you like beside it; do not write to it.
+
+Metadata is also where insert-side middleware puts things. Stamping the tenant onto every job from the request context, rather than remembering to pass it at each of your forty enqueue sites, is exactly what `Config.EnqueueMiddleware` is for — see [Middleware](/running/middleware).
+
+### WithVersion
+
+`WithVersion(v)` stamps a schema version on the row, defaulting to 1. Be clear about what that buys you today: **nothing acts on it.** The engine does not reject an unexpected version, does not route by it, and does not migrate anything.
+
+It is a stable place to record which shape of payload you wrote, so a worker reading `job.Version` can branch on it during a rollout you coordinate yourself.
+
+## Defaults on a job kind
+
+Every option above can be a property of the *kind* rather than of each enqueue, which is usually where it belongs. Implement `JobOptions() goque.JobOptions` on your args type and it applies to every job of that kind:
+
+```go
+func (ExportReport) JobOptions() goque.JobOptions {
+	return goque.JobOptions{
+		Queue:       "reports",
+		MaxAttempts: 3,
+		Timeout:     10 * time.Minute,
+	}
+}
+```
+
+That is the whole interface — no registration, no struct tag, no wiring. The method is optional, and a kind without it inherits the client's defaults.
+
+A second optional method, `Priority() time.Duration`, exists because `JobOptions()` cannot see the job's arguments and sometimes the boost depends on them:
+
+```go
+func (a GenerateInvoice) Priority() time.Duration {
+	if a.Plan == "enterprise" {
+		return 10 * time.Minute
+	}
+	return 0
+}
+```
+
+The boost it returns means what [`WithPriority`](/configuration/scheduling) means, and it is ignored if the kind's `JobOptions()` already set a non-zero `PriorityBoost`.
+
+Both methods receive the arguments you actually enqueued, so they can branch on the job's fields — the example above really does give enterprise invoices their ten minutes.
+
+## Defaults on the client
+
+`Config.Defaults` is the bottom layer: the values used when neither the enqueue nor the kind said anything.
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Defaults: goque.JobOptions{
+		Queue:       "default",
+		MaxAttempts: 25,
+		RetryPolicy: goque.Exponential{Base: 2 * time.Second, Max: 15 * time.Minute, Jitter: 0.1},
+	},
+})
+```
+
+That block is worth reading twice, because it sets exactly what `NewClient` would have set for you. Three fields are filled in when you leave them unset:
+
+| Field | Default |
+| --- | --- |
+| `Queue` | `"default"` |
+| `MaxAttempts` | `25` |
+| `RetryPolicy` | `Exponential{Base: 2s, Max: 15m, Jitter: 0.1}` |
+
+Everything else in `Config.Defaults` stays at its zero value, which means no client-wide priority boost, no delay, no timeout, no metadata, and version 1.
+
+So a job enqueued with no options anywhere lands in `default`, becomes eligible immediately, is never time-bounded, and gets 25 attempts spread over roughly four hours before it dies.
+
+## Next steps
+
+- **[Scheduling & Priority](/configuration/scheduling)** — when a job becomes eligible, and what order eligible jobs run in.
+- **[Retries & Backoff](/configuration/retries)** — the built-in policies and how to register your own.
+- **[Enqueueing Jobs](/basics/enqueueing)** — single inserts, batches, and what `EnqueueResult` tells you.
+- **[Middleware](/running/middleware)** — stamping request context onto every job at insert time.

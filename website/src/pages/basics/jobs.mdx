@@ -1,0 +1,199 @@
+---
+title: Defining Jobs
+description: Job kinds, arguments that survive the trip through JSON, per-kind defaults, and how to change a payload without stranding the jobs already in your queue.
+---
+
+# Defining Jobs
+
+Before anything can run in the background, you have to describe it. In goque that description is a plain Go struct: its fields are the payload, and one method gives it a name.
+
+```go
+type ResizeImage struct {
+	ImageID string `json:"image_id"`
+	Width   int    `json:"width"`
+}
+
+func (ResizeImage) Kind() string { return "image.resize" }
+```
+
+That is the whole `JobArgs` interface — a `Kind() string` method and nothing else. There is no base type to embed, no `init()` to remember, and no registration call at definition time. The struct is data; what to *do* with it lives in a [worker](/basics/workers).
+
+Two things about this struct will outlive your current deploy, though, and both are worth getting right on the first try: the kind string, and the shape of the fields.
+
+## The kind is a contract
+
+`Kind` is not a display name. It is written onto every job row and read back later to decide which worker runs it, so it is the one part of a job definition that other processes — and your own process after a restart — depend on.
+
+**Once jobs exist under a kind, changing it strands them.** A queue full of `image.resize` rows and a binary that now registers `images.resize` never find each other.
+
+Those jobs are not silently discarded; they fail, retry, and eventually go dead with `no worker registered for kind image.resize` in their error history. Recoverable, but a bad afternoon.
+
+:::warning[Rename the type freely, not the kind]
+The Go type name is yours to refactor — rename `ResizeImage` to `ImageResizeJob` and the compiler will walk you through it. The *string* is the stored identifier. Treat it the way you would treat a database column name.
+:::
+
+So pick a kind you can live with and keep it boring. A `domain.action` convention scales well and sorts nicely in logs and dashboards:
+
+```go
+func (SendWelcomeEmail) Kind() string { return "email.welcome" }
+func (ResizeImage) Kind() string      { return "image.resize" }
+func (GenerateInvoice) Kind() string  { return "invoice.generate" }
+func (DeliverWebhook) Kind() string   { return "webhook.deliver" }
+```
+
+Keep the method constant, too. Registration reads the kind from the zero value of your argument type, so a `Kind` that branches on a field would register under one name and enqueue under another, and the two would never meet.
+
+## Arguments have to survive JSON
+
+Job arguments are marshalled with `encoding/json` at enqueue and unmarshalled in whatever process picks the job up — possibly minutes later, possibly after a restart, possibly by a different binary. Only what JSON can carry makes the trip.
+
+This is where the one genuinely surprising failure mode lives. Consider an invoice job that a well-meaning refactor has grown a couple of extra fields:
+
+```go
+type GenerateInvoice struct {
+	InvoiceID string `json:"invoice_id"`
+	logger    *slog.Logger
+	Rendered  []byte `json:"-"`
+}
+```
+
+Enqueue that and the stored payload is:
+
+```json
+{"invoice_id":"inv_1"}
+```
+
+`logger` is unexported, so `encoding/json` never sees it. `Rendered` is excluded by its own tag. Neither one errors — they arrive at the worker as zero values, and the worker nil-panics or writes an empty PDF while every field you *can* see looks fine.
+
+The rule is short: **exported fields with json tags are the payload; everything else is decoration.** Add tags even where the default would do, because the default is the Go field name — `InvoiceID`, not `invoice_id` — and that is a rename waiting to happen.
+
+Dependencies belong on the worker, not in the args. That is exactly what the [struct worker form](/basics/workers) is for.
+
+:::tip
+`goque.RunWorker` round-trips arguments through JSON before calling your worker, exactly as production does. A field that would not survive encoding is missing there too, so a plain unit test catches this whole class of bug with no queue involved. See [Testing Jobs](/testing).
+:::
+
+## Keep the payload small
+
+It is tempting to put everything the worker could possibly need into the args struct. Resist it, and pass identifiers instead:
+
+```go
+// Good: the worker fetches what it needs.
+type GenerateInvoice struct {
+	InvoiceID string `json:"invoice_id"`
+}
+
+// Avoid: the whole invoice, inline.
+type GenerateInvoice struct {
+	Invoice   Invoice    `json:"invoice"`
+	LineItems []LineItem `json:"line_items"`
+	Customer  Customer   `json:"customer"`
+}
+```
+
+Two reasons, and the second matters more than people expect.
+
+**The payload is stored per job and travels with every attempt.** It is written once, read back on every claim, and carried through each retry and rescue. A hundred thousand queued jobs holding a hundred kilobytes each is ten gigabytes of queue, and that weight is paid on every fetch, not just at enqueue.
+
+**An embedded copy is a snapshot that goes stale.** The payload freezes the world as it looked at enqueue time. If the invoice is corrected two minutes later and the job runs an hour after that — or retries tomorrow — it renders the old numbers, confidently. An ID makes the worker read current state, which is almost always what you meant.
+
+The exception is data you genuinely want frozen: the email address someone typed at signup, the price they were quoted. Store that deliberately, because you want the snapshot, not because it was convenient.
+
+## Changing arguments safely
+
+Jobs already in the queue were encoded by the *previous* version of your code. Any change you deploy has to be readable by both — for at least as long as your longest backoff, which under the default retry policy means old rows can resurface fifteen minutes later, and for a job scheduled a week out means a week.
+
+Additive changes are safe. A new optional field decodes to its zero value in old rows:
+
+```go
+type ExportReport struct {
+	AccountID string `json:"account_id"`
+	Format    string `json:"format,omitempty"` // added later
+}
+```
+
+Old jobs arrive with `Format: ""`, so give the worker a fallback and you are done:
+
+```go
+format := job.Args.Format
+if format == "" {
+	format = "csv"
+}
+```
+
+Renaming a field, changing its type, or removing one the worker still needs are all breaking — and they break *silently*, because JSON does not complain about a key it does not recognize, or one it cannot find.
+
+When you truly need a different shape, take the long way round:
+
+1. Add the new field alongside the old.
+2. Deploy a worker that reads either.
+3. Wait out the backlog.
+4. Only then delete the old field.
+
+### What `Version` does, and what it doesn't
+
+Every job row carries an args schema version stamped at enqueue. It defaults to `1`, and you can set it per enqueue or as a job-kind default:
+
+```go
+client.Enqueue(ctx, ExportReport{AccountID: "acct_1"}, goque.WithVersion(2))
+```
+
+:::note[Version is a stamp, not a migration]
+goque stores the version and hands it to your worker on `job.Version`. It does **not** act on it: there is no migration hook, no per-version dispatch, and no validation — a job stamped version 3 reaches your worker exactly like one stamped version 1. `backend.ErrVersionMismatch` exists in the API surface but is never returned today.
+
+So `Version` is a marker you branch on yourself, not an escape hatch from the additive-changes discipline above. Plan for additive changes; use the stamp if you want your own branching to be explicit.
+:::
+
+## Defaults for a kind
+
+Most of the per-job knobs — queue, attempts, timeout — are properties of the *job type* rather than of a particular call site. Rather than repeat them at every enqueue, a job kind can carry its own defaults by implementing an optional method:
+
+```go
+func (ExportReport) JobOptions() goque.JobOptions {
+	return goque.JobOptions{
+		Queue:       "reports",
+		MaxAttempts: 5,
+		Timeout:     10 * time.Minute,
+	}
+}
+```
+
+Every report export now lands on the `reports` queue with five attempts and a ten-minute ceiling, without a single option at the call site:
+
+```go
+client.Enqueue(ctx, ExportReport{AccountID: "acct_1"})
+```
+
+These are defaults, not rules. **Per-enqueue options win over job-kind defaults, which win over the client's `Config.Defaults`**, and any field left at its zero value falls through to the next layer. So one urgent export can still be pushed elsewhere:
+
+```go
+client.Enqueue(ctx, ExportReport{AccountID: "acct_1"}, goque.WithQueue("reports-priority"))
+```
+
+A second optional method, `Priority`, sets the kind's default priority boost — expressed as a duration, because [priority in goque is a time boost](/configuration/options) rather than a rank:
+
+```go
+func (SendCampaign) Priority() time.Duration { return 5 * time.Minute }
+```
+
+Both methods are called with the actual arguments you enqueued, so a boost can read the job's own fields:
+
+```go
+func (a SendCampaign) Priority() time.Duration {
+	if a.Transactional {
+		return 10 * time.Minute
+	}
+	return 0
+}
+```
+
+`Priority` is ignored if the kind's `JobOptions` already set a non-zero `PriorityBoost`, so pick one place to say it.
+
+The full set of knobs, and how the three layers resolve, is on [Job Options](/configuration/options).
+
+## Next steps
+
+- **[Workers](/basics/workers)** — the two ways to write the code that runs your job.
+- **[Job Options](/configuration/options)** — every per-job knob, and the resolution order in detail.
+- **[Enqueueing Jobs](/basics/enqueueing)** — single inserts, batches, and where to call them from.
+- **[Testing Jobs](/testing)** — `RunWorker` and the fake clock.

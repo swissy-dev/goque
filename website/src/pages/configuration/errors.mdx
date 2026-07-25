@@ -1,0 +1,197 @@
+---
+title: Error Handling
+description: Returning errors, stopping a job permanently with Cancel, waiting with SnoozeFor, overriding one attempt's timing with RetryAt, and the panic path.
+---
+
+# Error Handling
+
+The default is the one you want most of the time: return an error, and the job tries again.
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[SyncContact]) error {
+	if err := crm.Upsert(ctx, job.Args.ContactID); err != nil {
+		return err
+	}
+	return nil
+})
+```
+
+That failure is recorded on the job with its attempt number and timestamp, the job is rescheduled according to its retry policy, and when the attempts run out it becomes `dead` — retained with the whole error history rather than deleted. [Retries & Backoff](/configuration/retries) covers that path in full.
+
+But "try again in a bit" is not always the right answer, and the interesting part of error handling is the three cases where it isn't. All three are ordinary error values that you return from `Work`.
+
+## Cancel: this will never succeed
+
+Some failures are not transient. The user was deleted between the enqueue and the run. The upload was a 400-page PDF where a JPEG was promised. The account closed. Retrying these twenty-four more times over four hours costs you four hours of noise and gets you a dead job that says the same thing it said at 09:02.
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[SendTrialReminder]) error {
+	user, err := users.Find(ctx, job.Args.UserID)
+	if errors.Is(err, users.ErrNotFound) {
+		return goque.Cancel(fmt.Errorf("user %s deleted since enqueue", job.Args.UserID))
+	}
+	if err != nil {
+		return err
+	}
+
+	return mailer.SendTrialReminder(ctx, user)
+})
+```
+
+`goque.Cancel(err)` stops the job permanently. It moves to `cancelled` immediately, whatever attempts it had left, and your error message is recorded as its final attempt error so the reason is still there when someone asks.
+
+Note the shape of that worker: the *known* permanent condition is cancelled, and everything else falls through to a plain `return err` and retries. That is the right instinct.
+
+Cancel the cases you have positively identified as hopeless; let the unknown ones retry, because "I have never seen this error before" is not evidence that trying again won't work.
+
+Cancelled and dead are different states with different retentions, and the distinction is the point: dead means *goque gave up*, cancelled means *your code decided*. When you are looking at a queue full of failures, that is the first thing you want to know.
+
+:::warning[The error must not be nil]
+`goque.Cancel(nil)` is not a supported way to say "stop, no reason". The executor reads the error's message when it records the cancellation, so a nil dereferences and panics outside the worker's recover — which will take the process down. The same applies to `goque.RetryAt`. Always pass a real error.
+:::
+
+## SnoozeFor: not failed, just not ready
+
+This one is easy to overlook and disproportionately useful.
+
+A job is only sometimes failing. Often it is *waiting* — the CSV hasn't finished uploading, the upstream export isn't ready, the ledger closes at midnight and it is 23:58.
+
+Returning an error for that technically works, but it is a lie with a cost attached: every wait burns an attempt, and after enough waiting the job is declared dead for the crime of being early.
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[ImportRows]) error {
+	ready, err := uploads.Ready(ctx, job.Args.UploadID)
+	if err != nil {
+		return err
+	}
+	if !ready {
+		return goque.SnoozeFor(30 * time.Second)
+	}
+
+	return importer.Run(ctx, job.Args.UploadID)
+})
+```
+
+`goque.SnoozeFor(d)` reschedules the job for `d` from now and **gives the attempt back**. The attempt counter is rolled back, no error is recorded, and the error history stays clean. A job can snooze all afternoon and still have its full attempt budget available for real failures when the work finally starts.
+
+That is the whole distinction: the attempt budget is a budget for *failures*. Spending it on waiting means the job that waited an hour has fewer chances than the one that didn't, which is exactly backwards — the one that waited an hour is about to do the harder work.
+
+:::note
+Nothing caps the number of snoozes. The count is recorded on the job's metadata so you can see it, but a worker that always snoozes will snooze forever. If the thing you are waiting for might never arrive, put a deadline in the job's own arguments — the time you gave up waiting — and return `goque.Cancel` when you pass it.
+:::
+
+## RetryAt: this attempt, at this time
+
+Your retry policy is a good guess about when to come back. Sometimes you do not have to guess.
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[DeliverWebhook]) error {
+	resp, err := http.Post(job.Args.URL, "application/json", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == http.StatusTooManyRequests {
+		if secs, err := strconv.Atoi(resp.Header.Get("Retry-After")); err == nil {
+			return goque.RetryAt(
+				time.Now().Add(time.Duration(secs)*time.Second),
+				fmt.Errorf("endpoint %s rate limited", job.Args.EndpointID),
+			)
+		}
+		return fmt.Errorf("endpoint %s rate limited", job.Args.EndpointID)
+	}
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("endpoint %s returned %d", job.Args.EndpointID, resp.StatusCode)
+	}
+	return nil
+})
+```
+
+A `429` carrying `Retry-After: 90` has told you precisely when it will accept the request. `goque.RetryAt(t, err)` overrides the policy's answer for this attempt only — the job comes back at `t`, and the next failure, if there is one, goes back to using the normal curve.
+
+Two things stay true:
+
+- **The attempt is consumed** — this was a failure, and your error is recorded like any other.
+- **`MaxAttempts` still applies** — a job that used its last attempt becomes `dead` rather than retrying at `t`.
+
+`RetryAt` moves a retry; it does not create one.
+
+That last point is what keeps the option safe. A rate-limited endpoint that keeps saying "come back in an hour" will eventually exhaust the job's budget and leave you a dead job with a legible history, rather than a job that politely reschedules itself forever.
+
+## Panics
+
+A worker that panics does not take your process down. The executor recovers every panic, records the recovered value and the stack trace on the attempt, and then retries the job under its normal policy — same curve, same attempt budget, same `dead` at the end of it.
+
+That is a deliberate position. The alternative — a nil map write in one job kind crashing a process that was happily running nine other kinds — is not a trade anyone wants to make at 3am.
+
+The stack ends up in the job's error history alongside the message, so the panic is debuggable after the fact without correlating logs by timestamp. If you need to recognise one in your own code, the executor produces a typed error:
+
+```go
+var pe *goque.PanicError
+if errors.As(err, &pe) {
+	report(pe.Recovered, pe.Stack)
+}
+```
+
+There is one wrinkle worth knowing. The executor's recovery sits *outside* your middleware chain, so a panic unwinds straight past your middleware — anything that does work after `next` returns (an error log, a metrics timer, a `Hooks.After` callback) is skipped.
+
+Installing `middleware.Recovery()` **last** in the slice puts it innermost, where it converts the panic into a `*goque.PanicError` before it unwinds, so your outer middleware still run and still see the failure. See [Middleware](/running/middleware) for why last means innermost.
+
+A timed-out attempt, by contrast, is nothing special: the context is cancelled, your worker returns `ctx.Err()`, and it is recorded and retried as an ordinary failure.
+
+## ErrorHandler and PanicHandler
+
+Everything above is per job. The two client-level hooks are how failures reach the rest of your world — Sentry, your alerting, a counter on a dashboard:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues:  map[string]goque.QueueConfig{"default": {Concurrency: 10}},
+
+	ErrorHandler: func(ctx context.Context, row *goque.JobRow, err error) {
+		sentry.CaptureException(err)
+		slog.Error("job attempt failed",
+			"kind", row.Kind, "id", row.ID, "queue", row.Queue,
+			"attempt", row.Attempt, "max_attempts", row.MaxAttempts, "err", err)
+	},
+
+	PanicHandler: func(ctx context.Context, row *goque.JobRow, recovered any, stack []byte) {
+		slog.Error("job panicked",
+			"kind", row.Kind, "id", row.ID, "attempt", row.Attempt,
+			"recovered", fmt.Sprint(recovered), "stack", string(stack))
+	},
+})
+```
+
+Both are called synchronously, on the goroutine that ran the job, before the outcome is written back — so keep them quick, and do the slow part asynchronously.
+
+The `ctx` they receive is the client's context, not the job's, so it is still usable even when the attempt failed because its own deadline expired.
+
+The part that matters, and that is easy to get wrong, is **when each one fires**:
+
+| Outcome | `ErrorHandler` | `PanicHandler` |
+| --- | --- | --- |
+| Plain error, job retries | yes | — |
+| Plain error, attempts exhausted (`dead`) | yes | — |
+| `RetryAt`, job retries | **no** | — |
+| `RetryAt` on the last attempt (`dead`) | yes | — |
+| `Cancel` | no | — |
+| `SnoozeFor` | no | — |
+| Panic, whether it retries or dies | no | yes |
+
+Read the `RetryAt` rows twice, because they are the surprise. A worker that translates every `429` into `RetryAt` is invisible to `ErrorHandler` for as long as it keeps rescheduling — you are only told when that job finally dies.
+
+Usually this is what you want: a rate limit handled correctly is not an incident. But if you are counting failures for a dashboard, `RetryAt` retries will not appear in your count, and you should measure them from worker middleware instead.
+
+`Cancel` and `SnoozeFor` never reach `ErrorHandler` at all, which is the same logic — neither is an unexpected failure. And a panic goes only to `PanicHandler`; if you want panics in your error alerting, report them from there too.
+
+[Observability](/running/observability) covers wiring these up alongside logging and metrics.
+
+## Next steps
+
+- **[Retries & Backoff](/configuration/retries)** — the curve that `RetryAt` overrides, and the attempt budget both respect.
+- **[Middleware](/running/middleware)** — `Recovery()` positioning, and measuring outcomes the handlers don't report.
+- **[Observability](/running/observability)** — logging, metrics, and getting failures to your alerting.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — `cancelled` versus `dead`, retention, and at-least-once execution.

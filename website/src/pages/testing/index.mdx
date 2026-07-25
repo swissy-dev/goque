@@ -1,0 +1,294 @@
+---
+title: Testing Jobs
+description: Drive your queue from a test with a clock you control — no sleeps, no goroutines, no flakes, and jobs that run through the real executor.
+---
+
+# Testing Jobs
+
+Testing background work is where most test suites quietly give up.
+
+The honest attempt looks like this: start the client, enqueue a job, `time.Sleep(2 * time.Second)`, then assert. It passes on your laptop and fails on a loaded CI runner, so somebody bumps the sleep to five seconds, and the suite gets slower every time a job does.
+
+The other attempt is to give up on the queue entirely — extract the logic into a plain function, test that, and never exercise the part where the job was enqueued with the wrong options, retried under the wrong policy, or scheduled for a Tuesday that never arrives.
+
+goque's answer is to hand you the clock:
+
+```go
+f := client.Fake(t)
+
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_1"}, goque.WithDelay(24*time.Hour))
+
+f.RunReady(ctx).AssertNoneRan()
+
+f.Advance(24 * time.Hour)
+f.RunReady(ctx).AssertRan("email.trial-reminder")
+```
+
+Nothing runs in the background. Time moves only when you move it, jobs execute only when you ask, and they execute on the test's own goroutine. There is no window in which a job might or might not have finished yet, so there is nothing to flake.
+
+**This is not a mock of the queue.** `Fake` replaces the client's clock and its execution trigger — nothing else.
+
+The job is stored by the same backend, claimed by the same fetch, decoded by the same registry, and run through the same executor, wrapped in your real middleware, under your real retry policy. If it would go dead in production it goes dead here, for the same reason.
+
+## Attaching the fake
+
+`Fake` wraps a client you have already built, so your test exercises the same construction path as production.
+
+```go [reminder_test.go]
+func TestTrialReminderWaitsADay(t *testing.T) {
+	var sent []string
+
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[SendTrialReminder]) error {
+		sent = append(sent, job.Args.UserID)
+		return nil
+	})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := client.Fake(t)
+
+	ctx := context.Background()
+	client.Enqueue(ctx, SendTrialReminder{UserID: "u_1"}, goque.WithDelay(24*time.Hour))
+
+	f.Advance(24 * time.Hour)
+	f.RunReady(ctx).AssertRan("email.trial-reminder")
+
+	if len(sent) != 1 {
+		t.Fatalf("sent = %v", sent)
+	}
+}
+```
+
+The important word is *wraps*. In a real suite that `NewClient` call is your application's own constructor, with your real middleware, your real defaults, and your real workers. `Fake` doesn't build a client for you, because a client it built for you would be a different client from the one you ship.
+
+Two requirements, both checked the moment you attach:
+
+- **The client must use the in-memory backend.** Anything else fails the test with `Fake requires the memory backend`.
+- **The client must be neither started nor stopping.** A client with a dispatcher already running has jobs in flight that the fake cannot account for.
+
+Note what is *not* required: `Config.Queues`. An enqueue-only client — the shape most web processes have — is perfectly testable, because the fake tracks every queue you enqueue to. `Config.Workers` *is* required, since something has to know how to run the jobs.
+
+Attach before you enqueue. The fake takes over the clock at attach time, so jobs created earlier are stamped with the real one. (Jobs already sitting in the backend are still found and run — their queues are picked up too — they just carry real timestamps.)
+
+:::warning[A faked client refuses to `Start`]
+`Start` on a faked client returns `goque: client is fake-driven`. The synchronous driver and the background dispatcher are mutually exclusive by design: if both were live, the dispatcher would claim jobs out from under your assertions and reintroduce exactly the races the fake exists to remove.
+
+Pick one. In a test, pick the fake.
+:::
+
+### The `TB` interface
+
+`Fake` takes a `goque.TB`, not a `*testing.T`:
+
+```go
+type TB interface {
+	Helper()
+	Fatalf(format string, args ...any)
+}
+```
+
+`*testing.T` satisfies it, as do `*testing.B` and `*testing.F`, so in practice you pass `t` and never think about it again.
+
+It exists so that goque — a library that ends up in your production binary — never imports `testing`, which would register test flags and pull the harness along with it. `Helper()` is what makes a failed assertion point at your test's line rather than a line inside the library.
+
+If you ever implement `TB` yourself, one rule matters: `Fatalf` must abort the calling goroutine the way `testing.T.Fatalf` does. The fake reports a misuse and then returns, so an implementation that merely logs will let the test carry on with a broken invariant.
+
+## Controlling time
+
+Three methods, driving the same clock the client stamps jobs with and compares schedules against.
+
+| Method | What it does |
+| --- | --- |
+| `f.Advance(d)` | Move the clock forward by `d`. A negative `d` fails the test. |
+| `f.SetNow(t)` | Jump to an instant. A `t` before the current time fails the test. |
+| `f.Now()` | Read the clock. |
+
+The clock starts wherever the client's clock was — `time.Now()`, unless you set `Config.Now` — and it only ever goes forward. Rewinding is rejected rather than permitted, because a job stamped before the rewind would suddenly look scheduled for the future, and every ordering assertion in your suite would start lying.
+
+Advancing does not run anything. It makes work *due*; running it is the next call.
+
+## Running jobs
+
+```go
+f.RunReady(ctx)
+```
+
+`RunReady` makes exactly one pass: it promotes everything that has come due, runs it, and returns. A job that this pass retries or snoozes is *not* picked back up, however short its delay — it waits for the clock to move and for you to call again. That is what lets you assert one step at a time.
+
+```go
+f.RunUntilIdle(ctx, 10)
+```
+
+`RunUntilIdle` runs round after round until a round runs nothing, **without advancing the clock**. It exists for cascades that are due immediately: a job that enqueues another job, or a failure whose retry policy has no backoff. Anything scheduled for the future is simply never reached, so the loop still terminates.
+
+The `maxRounds` argument is not a formality. Exceeding it fails the test with a message naming the likely cause, which is how a job that re-enqueues itself forever — or a zero-delay retry loop — gets caught in half a second instead of hanging CI until the timeout kills it.
+
+Both calls return a `*goque.RunResult` describing what ran. Every execution carries the `Round` it happened in, counting from 1, so you can tell a job that ran from the job it enqueued:
+
+```go
+res := f.RunUntilIdle(ctx, 10)
+
+for _, j := range res.Jobs {
+	t.Logf("round %d: %s -> %s", j.Round, j.Job.Kind, j.Outcome)
+}
+```
+
+## Asserting what ran
+
+`RunResult` carries assertions about the executions themselves — what ran, and how each one ended.
+
+```go
+res := f.RunReady(ctx)
+
+res.AssertRan("invoice.generate")   // at least one job of this kind ran
+res.AssertCompleted(1)              // exactly one execution succeeded
+res.AssertRetried(0)                // none failed into another attempt
+```
+
+The full set is `AssertRan(kind)`, `AssertNoneRan()`, and one counter per outcome: `AssertCompleted(n)`, `AssertRetried(n)`, `AssertDead(n)`, `AssertCancelled(n)`, `AssertSnoozed(n)`.
+
+When an assertion isn't the shape you need, the same data is exported. `Ran(kind)` is the predicate behind `AssertRan`, for a test that would rather branch than fail; `Of(kind)` returns just the executions of one kind; and `Jobs` is the whole slice:
+
+```go
+res := f.RunReady(ctx)
+
+for _, j := range res.Of("webhook.deliver") {
+	if j.Outcome == goque.OutcomeRetried && !strings.Contains(j.Err, "502") {
+		t.Fatalf("retried for the wrong reason: %s", j.Err)
+	}
+}
+```
+
+Each entry embeds a `goque.JobResult`: `Job` is the row exactly as the worker saw it — so `Job.Attempt` is the attempt that just ran — plus the `Outcome` and, for a failure, the `Err` message.
+
+## Asserting what is stored
+
+Executions are half the story. The other half is what the job looks like in the backend afterwards, because that is what a *later* run will act on.
+
+```go
+res, _ := client.Enqueue(ctx, GenerateInvoice{OrderID: "o_42"})
+
+f.RunReady(ctx)
+
+f.AssertState(res.Job.ID, backend.StateCompleted)
+f.AssertPending(0)
+```
+
+- `AssertState(id, state)` checks one job's state. The constants live in the `backend` package: `backend.StateScheduled`, `StateAvailable`, `StateRunning`, `StateRetryable`, `StateCompleted`, `StateCancelled`, `StateDead`.
+- `AssertPending(n)` counts every job, across every queue, still in a non-terminal state. It is the "nothing was left over" check, and a good last line for a test.
+- `Job(id)` hands you a copy of the stored row for anything else — attempt count, schedule, error history:
+
+```go
+row := f.Job(id)
+if row.Attempt != 3 {
+	t.Fatalf("attempt = %d, want 3", row.Attempt)
+}
+```
+
+The copy is a snapshot. Mutating it changes nothing.
+
+## A retry, end to end
+
+This is the test that is genuinely awkward to write any other way. A webhook delivery fails, backs off, and succeeds on the second attempt — asserted at every step, in about a millisecond.
+
+```go [webhook_test.go]
+func TestWebhookRetriesAfterBackoff(t *testing.T) {
+	var attempts int
+
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[DeliverWebhook]) error {
+		attempts++
+		if attempts == 1 {
+			return errors.New("502 from endpoint")
+		}
+		return nil
+	})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{
+		Workers:  workers,
+		Defaults: goque.JobOptions{RetryPolicy: goque.Fixed{Interval: 30 * time.Second}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := client.Fake(t)
+
+	ctx := context.Background()
+	res, err := client.Enqueue(ctx, DeliverWebhook{URL: "https://example.com/hook"})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	// The first attempt fails and is rescheduled 30s out.
+	f.RunReady(ctx).AssertRetried(1)
+	f.AssertState(res.Job.ID, backend.StateRetryable)
+
+	// The backoff has not elapsed, so nothing is due.
+	f.RunReady(ctx).AssertNoneRan()
+
+	// Now it has.
+	f.Advance(30 * time.Second)
+	f.RunReady(ctx).AssertCompleted(1)
+
+	f.AssertState(res.Job.ID, backend.StateCompleted)
+	f.AssertPending(0)
+
+	if attempts != 2 {
+		t.Fatalf("attempts = %d, want 2", attempts)
+	}
+}
+```
+
+The middle assertion — `AssertNoneRan` straight after the failure — is the one that catches real bugs. It proves the retry was genuinely *scheduled* rather than re-run in a tight loop.
+
+:::tip[Pin the retry policy in tests]
+The default policy is `Exponential` with jitter, so the exact backoff is deliberately unpredictable. You have two options: advance past the largest delay the policy could pick, or set `goque.Fixed{Interval: ...}` in the client's `Defaults` (or on the job with `goque.WithRetryPolicy`) and advance by exactly that.
+
+The second reads better and never flakes. See [Retries & Backoff](/configuration/retries).
+:::
+
+## Unit-testing a worker on its own
+
+Sometimes the queue isn't what you're testing — the worker's logic is. `RunWorker` calls it directly, with no client, no backend, and no middleware:
+
+```go
+err := goque.RunWorker(context.Background(),
+	&ResizeWorker{Storage: storage},
+	ResizeImage{ImageID: "img_1", Width: 800})
+```
+
+Nothing is enqueued or stored, nothing is retried, and control errors such as `goque.Cancel` and `goque.SnoozeFor` come back to you untouched instead of being acted on — so you can assert on them directly.
+
+One detail makes this more than a plain function call: **the arguments round-trip through JSON first**, exactly as they would in production. The worker receives a value that was marshalled and unmarshalled, not the one you passed.
+
+So a field that is unexported, or missing its `json` tag, or holding a type that doesn't survive encoding, arrives empty here for precisely the reason it would arrive empty at 3am — and the test catches it now instead.
+
+The worker sees a synthetic row: attempt 1 of 1, generation 1, no ID.
+
+`RunWorker` takes a `goque.Worker[T]`, so it wants the struct form of a worker. That is usually what you want to unit-test anyway, since the struct form is the one with dependencies to substitute.
+
+## What the fake does not simulate
+
+The fake is honest about its edges, and knowing them saves you an afternoon.
+
+**Context deadlines are real wall-clock.** `goque.WithTimeout(30*time.Second)` installs a genuine `context.WithTimeout`, because Go contexts cannot be driven by a simulated clock. Advancing the fake clock by an hour will not expire it.
+
+To exercise timeout handling, use a short real duration, or test the worker's context handling directly through `RunWorker` with a context you cancel yourself.
+
+**Middleware durations are real wall-clock too.** Anything measured with `time.Since` — the shipped `Logger`, a `Hooks.After` callback, your own metrics — reports microseconds, not the hours you advanced.
+
+**Jobs run one at a time, on your goroutine.** `Concurrency`, `Weight`, `MaxWorkers`, and `StrictQueuePriority` are dispatcher settings, and the dispatcher isn't running; the fake drains its tracked queues in name order. Determinism is the whole point, but it does mean the fake is not where you verify that your queue weights are tuned correctly.
+
+**Maintenance loops are not running.** No heartbeats, no rescuer, no cleaner. Finalized jobs are therefore never deleted, which is convenient: `f.Job(id)` can still inspect a job that completed twenty simulated days ago.
+
+**The memory backend is required**, which follows from the fake needing the inspection helpers only that backend provides. See [Backends](/reference/backends).
+
+## Next steps
+
+- **[Testing Patterns](/testing/patterns)** — HTTP handlers, shared fixtures, parallel tests, and the dead path.
+- **[One-Shot Processing](/running/one-shot)** — `ProcessReady`, the production API the fake drives.
+- **[Retries & Backoff](/configuration/retries)** — the policies your retry tests assert against.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — the states your assertions are checking.

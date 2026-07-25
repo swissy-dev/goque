@@ -1,0 +1,251 @@
+---
+title: The Client
+description: Constructing a client, the difference between an enqueue-only and a working client, and every Config field with its real default.
+---
+
+# The Client
+
+The client is the one object your application holds onto. It owns the backend connection, the worker registry, the queues this process works, and every default that a job falls back to. Jobs go in through it and workers are started by it.
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"default": {Concurrency: 10},
+	},
+})
+```
+
+Two arguments, and only the first is required. The **backend** is where jobs are stored — pass `nil` and `NewClient` returns an error, because there is nowhere to put anything. The **config** is a pointer and may be `nil`, which gives you library defaults for everything:
+
+```go
+client, err := goque.NewClient(memory.New(), nil)
+```
+
+Construction starts no goroutines and never touches the backend. `NewClient` validates, fills in defaults, and returns. Nothing happens in the background until you call [`Start`](/running/lifecycle).
+
+## Two shapes of client
+
+The same type covers two quite different roles, and which one you get depends entirely on whether `Config.Queues` is populated.
+
+**An enqueue-only client** has no queues. It inserts jobs perfectly well and refuses to run them:
+
+```go
+client, err := goque.NewClient(memory.New(), nil)
+
+client.Enqueue(ctx, ResizeImage{ImageID: "img_1", Width: 800}) // fine
+
+client.Start(ctx)
+// goque: no queues configured; this is an enqueue-only client
+```
+
+That error is a feature. A web process that hands work to a worker fleet should never quietly start processing jobs because someone forgot a config block, so the absence of queues is treated as an explicit statement of intent rather than an oversight.
+
+**A working client** names the queues it processes and how much of each it will run at once:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"critical": {Concurrency: 10, Weight: 6},
+		"default":  {Concurrency: 5, Weight: 3},
+		"bulk":     {Concurrency: 2, Weight: 1},
+	},
+})
+```
+
+A working client is also an enqueueing client — `Enqueue` works exactly the same on both. The queues are what add the second role, not what replace the first.
+
+:::warning[Today, both roles live in one process]
+The split above describes how goque is designed to be deployed, and with the in-memory backend you cannot actually deploy it that way: the backend keeps jobs inside the process that enqueued them, so an enqueue-only client in a separate binary would hand jobs to a store nobody else can see.
+
+For now, enqueue and work in the same process. The enqueue-only shape becomes genuinely useful once a shared database backend exists — Postgres, SQLite, and Redis are designed and specced but not yet built. See the [Roadmap](/reference/roadmap).
+:::
+
+## Configuring it
+
+Every field on `Config` is optional; the zero `Config` produces a perfectly usable enqueue-only client. What follows groups the fields by what they are for, with the actual defaults `NewClient` fills in.
+
+### Wiring
+
+Which jobs this client knows how to run, and how much of them it runs at once.
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `Workers` | `*Workers` | `nil` | The registry of job kinds this client can run. Required to work jobs; an enqueue-only client does not need one. |
+| `Queues` | `map[string]QueueConfig` | `nil` | Which queues this client processes, and their settings. Empty means enqueue-only. |
+| `MaxWorkers` | `int` | Sum of the queues' `Concurrency` | Caps jobs in flight across *all* queues. |
+| `StrictQueuePriority` | `bool` | `false` | Drains heavier queues completely before touching lighter ones. Can starve the light ones. |
+
+`MaxWorkers` defaulting to the sum means the per-queue caps are the only limit unless you say otherwise. Set it lower to bound the whole process — useful when the queue concurrencies are sized for a burst that they should never all take at once.
+
+Each `QueueConfig` carries three fields:
+
+- `Concurrency` — required, and must be greater than zero, or `NewClient` returns an error naming the queue.
+- `Weight` — defaults to `1`.
+- `PollInterval` — defaults to `500ms`.
+
+[Queues & Concurrency](/running/queues) covers how weight and polling actually behave — including the fact that `PollInterval` is not really per-queue.
+
+:::note
+`NewClient` copies your `Config`, and clones the `Queues` map while it does. Filling in a queue's default `Weight` and `PollInterval` therefore never mutates the map you passed in, so a map shared between two clients — or read back by your own config code — stays exactly as you wrote it.
+:::
+
+### Defaults
+
+The bottom layer of job option resolution.
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `Defaults` | `JobOptions` | see below | Client-wide fallback for any knob that neither the enqueue nor the job kind sets. |
+
+`NewClient` fills in the unset fields of `Defaults`:
+
+- `Queue` → `"default"`
+- `MaxAttempts` → `25`
+- `RetryPolicy` → `goque.Exponential{Base: 2 * time.Second, Max: 15 * time.Minute, Jitter: 0.1}`
+
+Everything else — `Timeout`, `PriorityBoost`, `Metadata` — stays at its zero value, meaning unset. So a client with no `Defaults` at all gives every job twenty-five attempts on the `default` queue with exponential backoff and no timeout.
+
+Override the ones you care about and leave the rest:
+
+```go
+&goque.Config{
+	Defaults: goque.JobOptions{
+		MaxAttempts: 10,
+		Timeout:     2 * time.Minute,
+	},
+}
+```
+
+Resolution runs **per-enqueue option → job-kind default → `Config.Defaults`**, most specific first. [Job Options](/configuration/options) has the full picture.
+
+### Middleware
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `WorkerMiddleware` | `[]Middleware` | `nil` | Wraps every job execution. |
+| `EnqueueMiddleware` | `[]EnqueueMiddleware` | `nil` | Wraps every insert, including batches. |
+
+Both are shaped like `net/http` middleware, and in both slices **the first entry is the outermost wrapper**. That ordering matters more than it looks — [Middleware](/running/middleware) explains why `Recovery()` belongs at the *end* of the worker chain.
+
+### Observability
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `Logger` | `*slog.Logger` | `slog.Default()` | Receives the client's own operational logging. |
+| `ErrorHandler` | `func(ctx, *JobRow, error)` | `nil` | Called when an attempt fails, whether the job retries or dies. |
+| `PanicHandler` | `func(ctx, *JobRow, any, []byte)` | `nil` | Called when a job panics, with the recovered value and its stack. |
+
+The two handlers are your hook into error reporting:
+
+```go
+&goque.Config{
+	ErrorHandler: func(ctx context.Context, row *goque.JobRow, err error) {
+		sentry.CaptureException(err)
+	},
+	PanicHandler: func(ctx context.Context, row *goque.JobRow, recovered any, stack []byte) {
+		sentry.CaptureMessage(fmt.Sprintf("panic in %s: %v\n%s", row.Kind, recovered, stack))
+	},
+}
+```
+
+They are deliberately not interchangeable. `ErrorHandler` is *not* called for a panic — that goes to `PanicHandler` — and it is not called for `Cancel` or `SnoozeFor`, which are decisions rather than failures. A `RetryAt` failure only reaches it if that attempt was the job's last.
+
+[Observability](/running/observability) goes further, including the metrics story.
+
+### Timing and maintenance
+
+A running client keeps three maintenance loops and a heartbeat going. The defaults are sensible for most deployments; these exist for when they are not.
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `HeartbeatInterval` | `time.Duration` | `30s` | How often running jobs report liveness — and how often stale ones are rescued. |
+| `RescueTTL` | `time.Duration` | `3 × HeartbeatInterval` (so `90s`) | How long a running job may go without a heartbeat before it is assumed lost and made retryable. |
+| `MoverInterval` | `time.Duration` | `1s` | How often scheduled and retryable jobs that have come due are made available. |
+| `CleanInterval` | `time.Duration` | `1m` | How often finished jobs past their retention are deleted. |
+| `CompletedRetention` | `time.Duration` | `24h` | How long completed jobs are kept. |
+| `CancelledRetention` | `time.Duration` | `7 days` | How long cancelled jobs are kept. |
+| `DeadRetention` | `time.Duration` | `7 days` | How long dead jobs are kept, with their full error history. |
+
+`RescueTTL` is derived from `HeartbeatInterval`, so lowering the heartbeat tightens the rescue window with it. The three-beat margin is what stops a single slow heartbeat from getting a perfectly healthy job rescued out from under a live worker.
+
+The retentions are how long you have to look at a failure before it disappears. Seven days for dead jobs is a Monday-morning-friendly default; if your on-call rotation is longer than that, raise it:
+
+```go
+&goque.Config{
+	DeadRetention: 30 * 24 * time.Hour,
+}
+```
+
+[Lifecycle & Guarantees](/reference/guarantees) explains what the rescuer, mover, and cleaner actually do.
+
+### The clock
+
+| Field | Type | Default | What it does |
+| --- | --- | --- | --- |
+| `Now` | `func() time.Time` | `time.Now` | The client's clock for job timestamps and scheduling decisions. |
+
+`Now` is clock injection, and it is the seam that makes goque's testing story work. Leave it `nil` and the client uses `time.Now`. Set it and every timestamp the client writes — `CreatedAt`, `ScheduledAt`, the retry time computed after a failure, the cutoffs the mover and cleaner compare against — comes from your function instead:
+
+```go
+fixed := time.Date(2026, 1, 1, 0, 0, 0, 0, time.UTC)
+
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Now: func() time.Time { return fixed },
+})
+```
+
+What it does *not* replace is wall-clock machinery. Tickers still tick in real time, `context` deadlines still expire in real time, and a `WithTimeout` on a job is still measured against the actual wall clock — Go contexts cannot run on a simulated clock.
+
+So `Now` moves the *queue's* sense of time, not the runtime's.
+
+:::tip
+You will rarely set `Now` by hand. `client.Fake(t)` takes it over for you and gives you `Advance`, `SetNow`, and synchronous execution on top — which is how a test can enqueue something for next Tuesday and assert on it in microseconds. See [Testing Jobs](/testing).
+:::
+
+## Putting it together
+
+A typical working client, with the fields most applications actually set:
+
+```go [main.go]
+workers := goque.NewWorkers()
+if err := goque.Register(workers, NewResizeWorker(images, db)); err != nil {
+	log.Fatal(err)
+}
+if err := goque.Register(workers, NewEmailWorker(mailer)); err != nil {
+	log.Fatal(err)
+}
+
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"critical": {Concurrency: 10, Weight: 6},
+		"default":  {Concurrency: 5, Weight: 3},
+		"bulk":     {Concurrency: 2, Weight: 1},
+	},
+	Defaults: goque.JobOptions{
+		MaxAttempts: 10,
+	},
+	WorkerMiddleware: []goque.Middleware{
+		middleware.Logger(slog.Default()),
+		middleware.Recovery(),
+	},
+	ErrorHandler: func(ctx context.Context, row *goque.JobRow, err error) {
+		sentry.CaptureException(err)
+	},
+	DeadRetention: 30 * 24 * time.Hour,
+})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+From here, `client.Start(ctx)` launches the workers and `client.Stop(ctx)` drains them. One client per process is the normal arrangement — a `Client` is safe for concurrent use, so pass the same one to every handler and service that needs to queue something.
+
+## Next steps
+
+- **[Enqueueing Jobs](/basics/enqueueing)** — single inserts, batches, and where to call them from.
+- **[Starting & Stopping](/running/lifecycle)** — `Start`, `Stop`, `StopAndCancel`, and draining without losing work.
+- **[Queues & Concurrency](/running/queues)** — weights, concurrency caps, and how work is shared out.
+- **[Testing Jobs](/testing)** — the fake clock built on `Config.Now`.

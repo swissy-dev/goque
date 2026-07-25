@@ -1,0 +1,193 @@
+---
+title: Quick Start
+description: A complete goque program — define a job, register a worker, start the client, enqueue work.
+---
+
+# Quick Start
+
+We are going to build a small program that sends a welcome email in the background, and a reminder a day later. It is short enough to read in one sitting and complete enough to run.
+
+Four things happen in every goque application, in this order:
+
+::::steps
+
+##### Define a job
+
+A job is a struct that reports a stable `Kind`.
+
+```go
+type SendEmail struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+}
+
+func (SendEmail) Kind() string { return "email.send" }
+```
+
+The struct is your payload — it gets serialized as JSON, so exported fields with tags are what survives. `Kind` is the name stored with the job and used to find its worker, so pick one you can live with.
+
+##### Write a worker
+
+A worker is a struct with a `Work` method.
+
+```go
+type EmailWorker struct {
+	goque.WorkerDefaults[SendEmail]
+}
+
+func (w *EmailWorker) Work(ctx context.Context, job *goque.Job[SendEmail]) error {
+	fmt.Println("sending to", job.Args.To, "—", job.Args.Subject)
+	return nil
+}
+
+workers := goque.NewWorkers()
+goque.Register(workers, &EmailWorker{})
+```
+
+`job.Args` is your `SendEmail` struct, fully typed. Return `nil` and the job is done; return an error and it retries.
+
+Give the struct fields when the work needs them — a mailer, a database handle — and they arrive by plain constructor injection:
+
+```go
+type EmailWorker struct {
+	goque.WorkerDefaults[SendEmail]
+	Mailer *Mailer
+}
+```
+
+That is what keeps a worker testable: you build it with a stub in a test exactly as you build it with the real thing here. See [Workers](/basics/workers).
+
+##### Create a client
+
+The client owns the backend, the worker registry, and the queues you want processed.
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"default": {Concurrency: 10},
+	},
+})
+```
+
+`Concurrency: 10` means up to ten `default` jobs run at once in this process.
+
+##### Start it, then enqueue
+
+```go
+client.Start(ctx)
+
+client.Enqueue(ctx, SendEmail{To: "ada@example.com", Subject: "Welcome!"})
+```
+
+`Start` launches the workers in the background and returns immediately. `Enqueue` hands over a job and returns as soon as it is stored — your request path never waits for the work itself.
+
+::::
+
+## The whole program
+
+```go [main.go]
+package main
+
+import (
+	"context"
+	"fmt"
+	"time"
+
+	"github.com/swissy-dev/goque"
+	"github.com/swissy-dev/goque/backend/memory"
+)
+
+type SendEmail struct {
+	To      string `json:"to"`
+	Subject string `json:"subject"`
+}
+
+func (SendEmail) Kind() string { return "email.send" }
+
+type EmailWorker struct {
+	goque.WorkerDefaults[SendEmail]
+}
+
+func (w *EmailWorker) Work(ctx context.Context, job *goque.Job[SendEmail]) error {
+	fmt.Println("sending to", job.Args.To, "—", job.Args.Subject)
+	return nil
+}
+
+func main() {
+	workers := goque.NewWorkers()
+	goque.Register(workers, &EmailWorker{})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{
+		Workers: workers,
+		Queues: map[string]goque.QueueConfig{
+			"default": {Concurrency: 10},
+		},
+	})
+	if err != nil {
+		panic(err)
+	}
+
+	ctx := context.Background()
+	if err := client.Start(ctx); err != nil {
+		panic(err)
+	}
+
+	client.Enqueue(ctx, SendEmail{To: "ada@example.com", Subject: "Welcome!"})
+	client.Enqueue(ctx, SendEmail{To: "ada@example.com", Subject: "How's it going?"},
+		goque.WithDelay(24*time.Hour))
+
+	time.Sleep(100 * time.Millisecond)
+
+	stopCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	client.Stop(stopCtx)
+}
+```
+
+```
+sending to ada@example.com — Welcome!
+```
+
+Only the first email prints, which is the point: the second was enqueued with `goque.WithDelay(24*time.Hour)` and is sitting in the queue waiting for tomorrow.
+
+:::note
+The `time.Sleep` is there only so this example doesn't exit before the worker runs. Real applications don't sleep — they block on a signal handler and then call `Stop`. See [Starting & Stopping](/running/lifecycle).
+:::
+
+## Shutting down properly
+
+`Stop` is worth understanding early, because getting it wrong is how jobs get lost.
+
+```go
+stopCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+client.Stop(stopCtx)
+```
+
+`Stop` stops claiming new work and then waits for jobs already in flight to finish, up to the deadline you give it. The context you pass is that deadline, not a cancellation signal for your jobs — right up until the deadline actually passes, at which point `Stop` cancels the stragglers' contexts, gives them a brief grace period, and returns. Draining continues in the background even then, so nothing is dropped on the way out. [Starting & Stopping](/running/lifecycle) covers the details.
+
+## Where the delayed job went
+
+You just enqueued something for tomorrow. In production it will simply run tomorrow. In a *test*, waiting is unacceptable — so goque lets you move the clock instead:
+
+```go
+f := client.Fake(t)
+
+client.Enqueue(ctx, SendEmail{To: "ada@example.com", Subject: "How's it going?"},
+	goque.WithDelay(24*time.Hour))
+
+f.RunReady(ctx).AssertNoneRan()
+
+f.Advance(24 * time.Hour)
+f.RunReady(ctx).AssertRan("email.send")
+```
+
+This runs the real worker through the real executor. It just doesn't take a day. [Testing](/testing) covers it properly.
+
+## Next steps
+
+- **[Defining Jobs](/basics/jobs)** — kinds, arguments, and changing them safely.
+- **[Workers](/basics/workers)** — dependency injection and the two ways to write a worker.
+- **[Retries & Backoff](/configuration/retries)** — what happens when a job fails.
+- **[Queues & Concurrency](/running/queues)** — separating urgent work from bulk work.

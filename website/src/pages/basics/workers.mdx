@@ -1,0 +1,221 @@
+---
+title: Workers
+description: Writing a worker as a struct with its dependencies, the function shorthand, what you get inside Work, why registration is a package-level function, and what happens to a job whose worker is missing.
+---
+
+# Workers
+
+A [job](/basics/jobs) is a description of work. A worker is the code that does it. You write one per job kind, hand it to a registry, and give the registry to a [client](/basics/client) — after that, goque decides when it runs.
+
+The registry is a plain map from kind to worker, built before anything starts:
+
+```go
+workers := goque.NewWorkers()
+```
+
+## Writing a worker
+
+Reach for a **struct worker** by default. Real work needs things from the outside world — a database handle, a mailer, an S3 client, a feature-flag service — and a struct is where those live.
+
+This is not incidental: job arguments are a JSON payload and dependencies are not. An `*sql.DB` cannot be serialized, so it belongs on the worker, never in the args.
+
+```go
+type ResizeWorker struct {
+	goque.WorkerDefaults[ResizeImage]
+	Images *ImageStore
+	DB     *sql.DB
+}
+
+func (w *ResizeWorker) Work(ctx context.Context, job *goque.Job[ResizeImage]) error {
+	return w.Images.Resize(ctx, job.Args.ImageID, job.Args.Width)
+}
+
+goque.Register(workers, &ResizeWorker{Images: images, DB: db})
+```
+
+Three things are worth noticing here.
+
+`goque.WorkerDefaults[T]` is an empty struct you embed to pick up default implementations of a worker's optional hooks. It carries no state and costs nothing; the embedding type still has to write `Work` itself.
+
+Dependencies arrive by ordinary constructor injection, which means the same worker is trivially testable with a stub:
+
+```go
+func NewResizeWorker(images *ImageStore, db *sql.DB) *ResizeWorker {
+	return &ResizeWorker{Images: images, DB: db}
+}
+```
+
+There is no container, no lifecycle, no per-job allocation: one worker instance handles every job of its kind, concurrently. If your worker holds mutable state, guard it — or don't hold any, which is easier.
+
+### The function shorthand
+
+For work that genuinely has no dependencies, `RegisterFunc` skips the type declaration:
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[PurgeExpiredSessions]) error {
+	return sessions.PurgeExpired(ctx)
+})
+```
+
+It is the same thing underneath — `RegisterFunc` wraps your function in a struct worker for you — so everything on this page applies equally to both, and short examples throughout these docs use it to stay terse.
+
+The reason to start with a struct anyway is that the shorthand stops paying off the moment the work grows.
+
+A closure that needs a database reaches for a package-level variable or captures one from an enclosing scope. Now the worker cannot be constructed with a stub, cannot be tested in isolation, and its dependencies are invisible at the registration site. A struct makes them a parameter list.
+
+:::tip
+If you find yourself capturing anything other than the job's own arguments inside a `RegisterFunc` closure, that is the signal to promote it to a struct.
+:::
+
+:::details[Why `Register` is a function and not a method]
+You would expect `workers.Register(...)`, and Go will not let you have it.
+
+Registration has to be generic — it needs `T` to know how to decode the payload and what to hand your `Work` method. But **Go does not permit a method to declare its own type parameters.** A method can only use type parameters that its receiver already has.
+
+That leaves two options. Either `Workers` becomes `Workers[T]`, which defeats the purpose — a registry exists precisely to hold *many* different job types at once, and a `Workers[SendEmail]` could hold exactly one. Or registration moves to a package-level function, where it is free to introduce `T` on its own.
+
+goque takes the second, which is why every registration call reads `goque.Register(workers, …)` with the registry as the first argument. It looks slightly unusual, and it is the only shape the language allows.
+:::
+
+## Inside `Work`
+
+Your worker receives a `*goque.Job[T]`, which is two things fused together: your decoded arguments, and the stored job row.
+
+```go
+func (w *ResizeWorker) Work(ctx context.Context, job *goque.Job[ResizeImage]) error {
+	// Your struct, fully typed. No casts, no map[string]any.
+	id := job.Args.ImageID
+
+	// The row is embedded, so its fields are promoted.
+	slog.Info("resizing",
+		"job_id", job.ID,
+		"kind", job.Kind,
+		"queue", job.Queue,
+		"attempt", job.Attempt,
+		"of", job.MaxAttempts,
+	)
+
+	return w.Images.Resize(ctx, id, job.Args.Width)
+}
+```
+
+`job.Args` is the part you reach for constantly. The promoted row fields are there when you need context about *this* execution:
+
+| Field | What it tells you |
+| --- | --- |
+| `job.ID` | The backend-assigned identifier. Good for log correlation. |
+| `job.Attempt` | Which attempt is running, counting from 1. |
+| `job.MaxAttempts` | How many it gets before it is declared dead. |
+| `job.Queue` | The queue it was claimed from. |
+| `job.Kind` | Its kind string. |
+| `job.Errors` | The history of previous failed attempts, oldest first. |
+
+`Attempt` and `MaxAttempts` together are what let a worker behave differently on its last try — degrade to a cheaper path, or write a user-visible failure record before the job dies:
+
+```go
+if job.Attempt == job.MaxAttempts {
+	if err := w.notifyFailure(ctx, job.Args.ImageID); err != nil {
+		slog.Error("could not record final failure", "err", err)
+	}
+}
+```
+
+## Honor the context
+
+Every worker gets a `ctx`, and passing it down is not a formality. It is how two separate mechanisms reach your code.
+
+**It carries the job's timeout.** A job enqueued with `goque.WithTimeout(30*time.Second)` gets a context that is cancelled after thirty seconds.
+
+Note what that means: goque cancels the *context*, it does not kill the goroutine. A worker that ignores `ctx` and blocks on a network read with no deadline runs to completion regardless, holding a concurrency slot the whole time. The timeout you configured does nothing.
+
+**It carries cancellation.** `Client.StopAndCancel` cancels running jobs' contexts so the process can exit promptly, and `Client.Stop` does the same to whatever is still running when its drain deadline expires.
+
+The plumbing for cancelling an individual job from elsewhere is in place too, though no public API requests one yet — see the [Roadmap](/reference/roadmap).
+
+In practice this is just the usual Go discipline — thread `ctx` into every call that takes one:
+
+```go
+func (w *ResizeWorker) Work(ctx context.Context, job *goque.Job[ResizeImage]) error {
+	row := w.DB.QueryRowContext(ctx, "SELECT path FROM images WHERE id = $1", job.Args.ImageID)
+	// ...
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, sourceURL, nil)
+	// ...
+}
+```
+
+## Returning
+
+`Work` returns an error, and that return value is the entire outcome protocol.
+
+**Return `nil`** and the job is completed. It will not run again.
+
+**Return an error** and the attempt is recorded — message and timestamp, appended to the job's error history — and the job is rescheduled under its retry policy. When the attempts run out it becomes *dead*, which means retained with that history rather than discarded.
+
+Wrap freely; goque stores `err.Error()`, so the context you add shows up in the record.
+
+```go
+if err := w.Images.Resize(ctx, job.Args.ImageID, job.Args.Width); err != nil {
+	return fmt.Errorf("resize %s to %dpx: %w", job.Args.ImageID, job.Args.Width, err)
+}
+return nil
+```
+
+**Panics do not take down the process.** The executor recovers them, records the stack on the attempt, and retries the job under its normal policy — the same as any other failure.
+
+Three control errors override the default behavior when the outcome is not simply success or failure:
+
+- `goque.Cancel` — stop permanently.
+- `goque.SnoozeFor` — wait without spending an attempt.
+- `goque.RetryAt` — pick your own retry time.
+
+[Error Handling](/configuration/errors) covers them properly.
+
+## Registration rules
+
+Two things about the registry are worth internalizing, because both fail in ways that are easier to understand up front than to debug later.
+
+**One worker per kind.** Registering a kind twice returns an error wrapping `backend.ErrDuplicateKind` — which usually means two bits of wiring both believe they own that kind, or that two job types accidentally report the same `Kind` string.
+
+Registration returns that error rather than panicking, so check it. In wiring code, failing loudly is the right response: a worker that did not register is a startup bug, not a runtime condition.
+
+```go
+if err := goque.Register(workers, NewResizeWorker(images, db)); err != nil {
+	log.Fatalf("register image.resize worker: %v", err)
+}
+```
+
+Use `errors.Is(err, backend.ErrDuplicateKind)` when you need to tell a double registration apart from anything else.
+
+**Register everything before `Start`.** A `Workers` registry is not safe for concurrent registration and is expected to be complete by the time the client begins claiming work. Build it, fill it, pass it to `goque.NewClient`, then start. Do not register from inside a worker.
+
+:::warning[A missing worker is a job failure, not a no-op]
+If a job's kind has no registered worker, goque does **not** drop it and does not skip it. The execution fails with `no worker registered for kind image.resize`, the attempt is recorded, and the job retries under its normal policy until its attempts run out and it goes dead.
+
+That is deliberate — during a rolling deploy an old process can legitimately meet a kind only the new binary knows, and retrying is the behavior that survives that.
+
+But it also means a typo'd kind or a forgotten `Register` shows up as a slow trickle of retrying jobs rather than a loud startup error. If a queue is retrying and going nowhere, check your registrations first.
+:::
+
+## Testing a worker
+
+Because a worker is an ordinary struct with an ordinary method, you can call it directly — no client, no backend, no queue:
+
+```go
+err := goque.RunWorker(context.Background(), &ResizeWorker{Images: fakeStore}, ResizeImage{
+	ImageID: "img_1",
+	Width:   800,
+})
+```
+
+`RunWorker` marshals your arguments to JSON and unmarshals them back before calling `Work`, exactly as production does, so a field that would not survive the round trip is missing here too.
+
+The worker sees a synthetic row — attempt 1 of 1, no ID — and control errors come back to you untouched instead of being acted on, which makes them straightforward to assert.
+
+That covers the worker's own logic. For the queue's behavior around it — retries, backoff, scheduling — see [Testing Jobs](/testing).
+
+## Next steps
+
+- **[The Client](/basics/client)** — wiring the registry to queues and starting them.
+- **[Error Handling](/configuration/errors)** — `Cancel`, `SnoozeFor`, `RetryAt`, and the panic path.
+- **[Middleware](/running/middleware)** — logging, metrics, and tracing around every execution.
+- **[Testing Jobs](/testing)** — `RunWorker` and the deterministic clock.

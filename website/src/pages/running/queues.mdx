@@ -1,0 +1,187 @@
+---
+title: Queues & Concurrency
+description: Isolate urgent work from bulk work with separate queues, and control how a client divides its capacity between them.
+---
+
+# Queues & Concurrency
+
+Suppose a customer clicks "export everything" and your application enqueues ten thousand report jobs. A minute later somebody else asks for a password reset. If both kinds of work sit in the same queue behind the same workers, the reset email waits for the export — not because it is slow, but because it is ten-thousandth in line.
+
+Queues exist to make that impossible. A queue is a lane: work in one lane never queues behind work in another. You give each lane its own concurrency and its own share of capacity, and the urgent email overtakes the backlog by construction rather than by luck.
+
+## Declaring queues
+
+`Config.Queues` maps a queue name to how that queue is worked. A client processes exactly the queues listed here and no others.
+
+```go [worker/main.go]
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"critical": {Concurrency: 10, Weight: 6},
+		"default":  {Concurrency: 20, Weight: 3},
+		"bulk":     {Concurrency: 5, Weight: 1},
+	},
+	MaxWorkers: 25,
+})
+```
+
+`Concurrency` is the only required field — `NewClient` returns an error for a queue that leaves it at zero.
+
+It caps how many jobs from that queue may be in flight in this process at once. Ten `critical` jobs can run together; the eleventh waits, no matter how idle the rest of the client is.
+
+Sending a job to a lane is a per-enqueue option:
+
+```go
+client.Enqueue(ctx, SendPasswordReset{UserID: user.ID}, goque.WithQueue("critical"))
+client.Enqueue(ctx, ExportOrders{AccountID: account.ID}, goque.WithQueue("bulk"))
+```
+
+Or, more durably, a property of the job kind itself, so nobody has to remember at each call site:
+
+```go
+func (ExportOrders) JobOptions() goque.JobOptions {
+	return goque.JobOptions{Queue: "bulk", MaxAttempts: 3}
+}
+```
+
+A job that names no queue lands in `default` — or in whatever you set as `Config.Defaults.Queue`. See [Job Options](/configuration/options) for how the three layers resolve.
+
+## MaxWorkers: the client-wide ceiling
+
+Per-queue `Concurrency` bounds each lane. `MaxWorkers` bounds the whole client, and it is the number that protects your database connection pool and your memory.
+
+If you leave it unset, `NewClient` fills it in with **the sum of every queue's `Concurrency`** — 35 for the config above. That default means the caps never interact: every queue can be fully busy at the same time.
+
+Setting it lower is the interesting case. With `MaxWorkers: 25` against 35 slots' worth of queues, the queues are oversubscribed: they cannot all run flat out simultaneously, so they compete — and how that competition resolves is what `Weight` decides.
+
+:::tip
+Pick `MaxWorkers` from a real constraint — connections in your pool, memory per job, an upstream API's concurrency limit — and let the per-queue numbers describe intent. Oversubscribing is a feature: it lets a quiet `critical` queue lend its idle slots to `bulk` instead of reserving them for work that isn't there.
+:::
+
+## Weight: how contended capacity is divided
+
+`Weight` is a queue's share of the slots when more work is waiting than there is room to run it. It defaults to `1`.
+
+goque divides capacity with **smooth weighted round-robin**. On each dispatch pass every queue that has room gains credit equal to its weight; the queue holding the most credit is served first and pays for the privilege by giving back the total weight of everyone competing.
+
+Repeat, and a weight-6 queue wins roughly six selections for every one a weight-1 queue wins. The important half of that sentence is the second one.
+
+:::note[Every queue with pending work makes progress]
+Weights bias the order; they never lock a queue out. A low-weight queue's credit rises on every pass it loses, so it eventually holds the most and is served next — that is arithmetic, not chance.
+
+The guarantee is **structural, not probabilistic**: there is no random draw that could come up "bulk" a thousand times in a row, and none that could fail to come up "bulk" for an hour.
+:::
+
+This matters most in the case that breaks naive schedulers: when slots free up **one at a time**.
+
+A ten-thousand-job export saturates the client. A `critical` job arrives, one export finishes, exactly one slot opens. A scheduler that split capacity by percentage would compute "bulk gets a tenth of one slot", round it away, and hand that slot to the heavy queue — forever.
+
+Smooth weighted round-robin instead hands the slot to whoever holds the most credit, so even single-slot dispatch cycles through every queue in weight proportion. Neither lane can wedge the other.
+
+Weights are relative, so `6/3/1` and `60/30/10` behave identically. Give the lane you would sacrifice last the largest number.
+
+## StrictQueuePriority: the opposite trade
+
+Sometimes you genuinely do want a lane served to exhaustion before anything else is touched. `StrictQueuePriority` turns weight from a share into a rank:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"critical": {Concurrency: 10, Weight: 6},
+		"default":  {Concurrency: 20, Weight: 3},
+		"bulk":     {Concurrency: 5, Weight: 1},
+	},
+	MaxWorkers:          25,
+	StrictQueuePriority: true,
+})
+```
+
+Now every free slot is offered to `critical` first. `default` is reached only once `critical` is out of available work or has hit its own `Concurrency`, and `bulk` only once both of the others have.
+
+:::warning[Strict priority can starve lower queues]
+This is not a stronger version of weighting — it is a different trade, and it gives up the progress guarantee above. A `critical` queue that always has work will hold every slot indefinitely and `bulk` will never run at all.
+
+That is *correct* behaviour when a lane genuinely must never be delayed by a lower one. It is a production incident when you enabled it expecting "critical goes a bit faster".
+
+Reach for it when starvation is the intent. Otherwise leave it false and use `Weight`.
+:::
+
+## Two dials, two jobs
+
+It is easy to conflate queue weight with per-job priority. They operate at different levels and do not substitute for each other:
+
+| Dial | Scope | Answers |
+| --- | --- | --- |
+| `QueueConfig.Weight` | Between queues | Which lane gets the next free slot? |
+| `goque.WithPriority(d)` | Within one queue | Which job in this lane is next in line? |
+
+`WithPriority` is a *time boost*: `goque.WithPriority(5*time.Minute)` sorts a job as if it had been enqueued five minutes earlier than it was. Because the boost applies to a job's effective age, and age keeps growing, a deprioritized job can never be held back forever either. [Scheduling & Priority](/configuration/scheduling) covers it properly.
+
+```go
+client.Enqueue(ctx, GenerateInvoice{OrderID: order.ID},
+	goque.WithQueue("default"),
+	goque.WithPriority(5*time.Minute),
+)
+```
+
+That invoice jumps the other `default` jobs. It does not jump the `critical` queue — nothing inside a queue can.
+
+## Polling and PollInterval
+
+Between dispatch passes the client waits. `PollInterval` sets that wait, defaulting to **500ms**, and the loop also wakes immediately whenever a job finishes.
+
+So a busy client is driven by completions, and the poll interval really only governs how quickly an idle client notices new work.
+
+`PollInterval` is declared per queue, which invites a natural but wrong reading. Consider a config that tries to poll `critical` aggressively and let `bulk` idle:
+
+```go
+Queues: map[string]goque.QueueConfig{
+	"critical": {Concurrency: 10, PollInterval: 50 * time.Millisecond},
+	"bulk":     {Concurrency: 5, PollInterval: 5 * time.Second},
+},
+```
+
+:::warning[PollInterval is not actually per queue]
+All queues share one dispatch loop, so the **smallest `PollInterval` among your configured queues sets the pace for every one of them.** The effective cadence above is 50ms across the board — the five seconds on `bulk` buys you nothing.
+
+Set it once, on the queue whose latency you care about most, and treat it as a client-wide setting. Lowering it costs backend round trips on an idle client and buys latency only when nothing is finishing.
+:::
+
+## Queue names are just strings
+
+A queue is not a declared resource. Nothing registers it, nothing creates it, and enqueueing to a name no client currently works is perfectly legal — those jobs simply sit there until something picks them up.
+
+That is what makes an enqueue-only client possible. A client with no `Queues` at all can still insert:
+
+```go [api/main.go]
+client, err := goque.NewClient(memory.New(), &goque.Config{})
+if err != nil {
+	return err
+}
+
+client.Enqueue(ctx, ResizeImage{ImageID: img.ID, Width: 1600}, goque.WithQueue("images"))
+```
+
+This client will refuse to `Start` — which is how forgetting your queues surfaces loudly instead of silently processing nothing. See [The Client](/basics/client).
+
+:::note
+Splitting producer and consumer across processes needs a backend both processes can see. The in-memory backend keeps jobs inside the process that enqueued them, so today this shape is for one binary that both enqueues and works. Shared backends are on the [Roadmap](/reference/roadmap).
+:::
+
+## Choosing your lanes
+
+A good default is three queues, named for latency expectation rather than for the feature that fills them:
+
+- **`critical`** — a human is waiting: password resets, 2FA codes, receipt emails. Modest concurrency, high weight, small blast radius.
+- **`default`** — the ordinary asynchronous work of the app: webhooks, thumbnails, search indexing.
+- **`bulk`** — anything that arrives ten thousand at a time: exports, backfills, nightly recomputation. Low concurrency deliberately, so a backfill cannot exhaust your database pool.
+
+Resist a queue per job kind. Queues isolate *latency classes*; twenty of them mostly means twenty ways to misconfigure concurrency. Add a fourth lane when you can name the work it is protecting other work from.
+
+## Next steps
+
+- **[Starting & Stopping](/running/lifecycle)** — launching the fetchers, and draining without dropping jobs.
+- **[Scheduling & Priority](/configuration/scheduling)** — ordering jobs inside a queue.
+- **[One-Shot Processing](/running/one-shot)** — working queues without a long-lived client.
+- **[The Client](/basics/client)** — configuration, defaults, and enqueue-only clients.

@@ -1,0 +1,172 @@
+---
+title: Roadmap
+description: What goque does today, what is designed but not yet built, and how to tell the difference.
+---
+
+# Roadmap
+
+goque is early. The core is finished and tested; a good deal of the surrounding system is designed in detail and not written yet.
+
+This page exists so you can tell which is which before you build on something.
+
+Everything under [Built today](#built-today) works, is covered by tests, and is documented elsewhere on this site. Everything under [Designed, not built](#designed-not-built) has a specification and no code — no API, no partial implementation, nothing to call.
+
+:::warning[Nothing in the planned section has an API today]
+If you find a symbol on this site or in the godoc that seems to implement one of the planned features, it doesn't. The reserved fields on `JobRow` are placeholders that backends store and nothing reads. Write your code against the built list.
+:::
+
+## Built today
+
+**The core engine.** Typed job arguments, generic workers, a kind-to-worker registry, and an executor that claims, runs, and finalizes. No reflection in the dispatch path. See [Defining Jobs](/basics/jobs) and [Workers](/basics/workers).
+
+**Correctness guarantees.** Exclusive claiming, generation-fenced finalization, heartbeat-based rescue of crashed workers, and self-fencing when a client loses contact with its backend. All of it exercised by the conformance suite. See [Lifecycle & Guarantees](/reference/guarantees).
+
+**The in-memory backend.** Complete, concurrency-safe, and conformant — and process-local, so what it is *for* is tests, local development, and single-process applications. See [Backends](/reference/backends).
+
+**The conformance suite.** `backendtest.Run` verifies any implementation against the contract in one line of test code, including the concurrency and fencing rules that are easy to get subtly wrong.
+
+**The testing story.** `client.Fake(t)` takes over the clock and drives execution synchronously, so background jobs can be tested without sleeps, goroutines, or flakes — through the real executor, not a mock. `goque.RunWorker` unit-tests a worker with no client at all. This is the part of goque that is furthest ahead. See [Testing Jobs](/testing).
+
+**Per-job options.** Queue, priority boost, delay or absolute schedule, max attempts, retry policy, timeout, metadata, and args version — each resolving per-enqueue, then per job kind, then per client. See [Job Options](/configuration/options).
+
+**Retries and error handling.** Four built-in backoff policies plus registered custom ones, all serialized with the job. Worker control errors — `Cancel`, `SnoozeFor`, `RetryAt` — for steering an individual attempt. Panics recovered, recorded with their stack, and retried.
+
+See [Retries & Backoff](/configuration/retries) and [Error Handling](/configuration/errors).
+
+**Queues and concurrency.** Per-queue concurrency caps, a client-wide worker ceiling, and smooth weighted round-robin between queues so no queue with work is starved — with strict priority available if you want it. See [Queues & Concurrency](/running/queues).
+
+**Middleware.** Two chains, both shaped like `net/http` middleware: one wrapping every execution, one wrapping every insert. `Recovery`, `Logger`, `Hooks`, and `Timeout` ship in the box. See [Middleware](/running/middleware).
+
+**Graceful shutdown.** `Stop` drains in-flight jobs within a deadline you set, heartbeating throughout so nothing is mistaken for dead work and run twice; `StopAndCancel` cancels running jobs instead. See [Starting & Stopping](/running/lifecycle).
+
+**One-shot processing.** `ProcessReady` runs everything currently due on the calling goroutine and returns — for cron containers, serverless invocations, and any deployment where something else owns the cadence. It is also the engine behind the fake. See [One-Shot Processing](/running/one-shot).
+
+**Batch enqueue.** `EnqueueMany` inserts a batch in one backend round trip, with options resolved per job.
+
+**Observability.** A structured logger, an error handler, a panic handler, and before/after hooks for metrics and tracing. See [Observability](/running/observability).
+
+## Designed, not built
+
+Each of these is specified — semantics, backend requirements, failure modes, and the conformance tests that will verify it. None is implemented.
+
+### Durable backends
+
+**Postgres, SQLite, and Redis.** The obvious gap, and the one that changes what goque is for. Today the in-memory backend keeps jobs inside the process that created them; a durable backend is what lets a web tier hand work to a separate worker fleet, and what lets a queue survive a deploy.
+
+**Transactional enqueue is the headline, not durability.** Durability you can get from any queue. What a database backend gives you that a separate queue service structurally cannot is the ability to enqueue a job *inside the transaction that created the reason for it*.
+
+Consider a signup: you insert the user row and enqueue a welcome email. With the queue in a different system, there are two writes and no way to make them agree.
+
+Commit the user, crash before enqueueing, and the customer never hears from you. Enqueue first, roll the transaction back, and you email a welcome to a user who does not exist and whose ID your worker cannot resolve.
+
+Every workaround — outbox tables, reconciliation sweeps, "just retry it" — is a re-implementation of the thing the database already does.
+
+When the job row lives in the same database as your business data, the problem stops existing. One transaction, one commit, one outcome. If it rolls back, the job was never created; if it commits, the job is there. This is why the Postgres and SQLite backends matter more than the Redis one, and why they will expose a transactional enqueue path.
+
+A related capability goes further: finalizing a job inside the worker's *own* transaction, so a job's side effects and its completion commit together.
+
+That collapses the at-least-once window to zero for side effects in that database — the only honest route to effectively exactly-once processing, and one that still cannot cover an outbound email or an HTTP call.
+
+### Enqueue-only clients
+
+**A dedicated type for processes that only produce work.** Today `Client` plays both roles: give it no `Queues` and it becomes enqueue-only, but it still carries the worker registry, the dispatcher machinery, and a config struct whose fields are mostly about running jobs. Nothing stops someone calling `Start` on it in your API binary.
+
+The plan is a separate `Enqueuer` with a small surface — `Enqueue` and `EnqueueMany`, a config covering only what inserting a job needs (defaults, insert-side middleware, logger, clock), and no `Start` to reach for by mistake. `Client` keeps enqueueing, because a worker legitimately schedules follow-up work.
+
+This is an API improvement rather than a capability: an `Enqueuer` still cannot reach a separate worker process until a durable backend exists.
+
+### Enqueueing from other languages
+
+**A TypeScript service should be able to hand work to a Go worker.** The runtime that creates the work is not always the one best suited to doing it, and a queue is a natural seam between them.
+
+What stands in the way is not the client library, it is that goque has never had to say out loud what enqueueing *is*. Producing a job means writing a `Kind`, a `Queue`, a JSON `Payload`, a `PriorityBoost`, `MaxAttempts`, a `ScheduledAt`, a serialized retry policy, a metadata object carrying a reserved `goque` key, and a `Version` — after which the backend derives the `ID`, `CreatedAt`, the initial state, and `PriorityAt` from `ScheduledAt` minus the boost.
+
+Every one of those rules currently exists only as Go code, which is precisely why nothing else can implement them.
+
+So this is two pieces. First, that contract written down and versioned, so a row inserted by another language is indistinguishable from one goque wrote itself. Then a thin TypeScript package that implements it.
+
+Both wait on a durable backend for the obvious reason: a Node process needs somewhere to write that a Go process can read.
+
+### Cron and periodic jobs
+
+Recurring schedules with stable entry names, per-entry time zones, and a once-per-tick guarantee across the whole cluster — including the awkward case where one instance enqueues *and completes* a tick before a slower instance gets around to inserting it.
+
+- **Leader election is the optimization, not the mechanism.** Entries run correctly without a leader, and use one only to avoid redundant work in large fleets.
+- **Firing at startup** and **never overlapping a previous run** are options in the design.
+- **Missed ticks are skipped**, not replayed.
+
+### Unique jobs
+
+Declarative deduplication: at most one job matching a key — derived from the kind, the arguments, the queue, and optionally a time bucket — in flight at once. The backend enforces it, rather than an advisory lock or a check-then-insert race in your code.
+
+First-wins: a duplicate enqueue returns the existing job instead of creating a second one. This is what makes `EnqueueResult.Skipped` meaningful; today it is always false, because nothing deduplicates yet.
+
+### Debounce
+
+The mirror image of unique jobs: last-wins coalescing for bursts. A stream of enqueues collapses into one run carrying the newest payload, firing after a period of quiet, with a hard deadline so a continuous stream cannot postpone it forever. For search reindexing, sync-on-change, and webhook storms.
+
+### Concurrency limits and throttling
+
+Per-queue `Concurrency` today is a *local* cap — worker slots in one process. The planned layer is cluster-wide: a ceiling on how many jobs of a kind may run at once across every instance, optionally per key, so that "at most one import running per customer" becomes a declaration rather than a distributed lock you maintain.
+
+Throttling is the rate-limited sibling: at most N *starts* per period, smoothed rather than bursty, for downstream APIs that publish a quota.
+
+Both are enforced inside the atomic claim, so an over-limit job simply is not eligible and does not block the jobs behind it. Neither ever drops work — they delay it.
+
+### Remote cancellation
+
+Cancelling a running job from outside the worker. The delivery path already exists in the contract: a flag persisted on the row, reported by the next heartbeat, which cancels that job's context.
+
+What is missing is the public API to set it. Today `goque.Cancel(err)` from inside a worker is the only way to cancel, and the memory backend's `SetCancelRequested` test helper stands in for the rest.
+
+### Recorded outputs
+
+A worker persisting a result onto the job row — fenced by generation like every other write, kept for failed jobs as well as successful ones. It is a debugging tool first: the answer to "what did this job actually decide?" three days later.
+
+### Queue pause and resume
+
+Stopping a queue from being claimed without stopping the client — for a deploy, an incident, or a downstream system that has asked you politely to stop. Jobs keep accumulating; nothing is lost.
+
+### Dead-letter tooling
+
+The `dead` state already *is* the dead-letter queue: exhausted jobs are retained with their error history rather than discarded. What is missing is the tooling around it:
+
+- listing and filtering jobs by state, queue, and kind;
+- inspecting one;
+- re-queueing it with its attempts reset;
+- deleting it.
+
+Queue statistics come from the same interface.
+
+## The reserved fields
+
+Reading the godoc for `JobRow`, you will find fields that nothing uses:
+
+| Field | Belongs to |
+| --- | --- |
+| `ConcurrencyKey` | cluster-wide concurrency limits |
+| `ThrottleKey` | throttling |
+| `DebounceKey`, `DebounceDeadline` | debounce |
+| `Output` | recorded outputs |
+| `CancelRequested` | remote cancellation |
+
+They are documented as reserved because a backend implemented today should store and return them, so that adding the features later does not require a migration for every existing deployment.
+
+`CancelRequested` is the exception that already works end to end — the flag is honored, there is just no public way to set it yet.
+
+Two sentinel errors are reserved the same way: `backend.ErrQueuePaused` and `backend.ErrVersionMismatch`.
+
+## No dates
+
+There are none, deliberately. goque is `v0.x` and the API will move until it settles; the order above is roughly the intended order, and the durable backends are first because everything else is more useful once they exist.
+
+Each of these has a written design behind it — backend capability interfaces, the concurrency and throttling algorithms, the cron tick-uniqueness argument, the crash matrix, and the conformance tests each feature adds — which is why the reserved fields above already exist.
+
+It is a design document, not documentation: it describes the system as intended, including all the parts that do not exist.
+
+## See also
+
+- **[Backends](/reference/backends)** — the contract the planned backends will implement.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — what is already guaranteed, and what isn't.
+- **[Introduction](/)** — where goque fits today.
+- **[Testing Jobs](/testing)** — the part that is furthest ahead.

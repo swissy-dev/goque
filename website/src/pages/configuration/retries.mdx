@@ -1,0 +1,235 @@
+---
+title: Retries & Backoff
+description: What happens when a worker returns an error — the attempt budget, the four built-in backoff curves, jitter, and registering your own.
+---
+
+# Retries & Backoff
+
+Background jobs fail for reasons that have nothing to do with your code. The payment provider is having an afternoon. The image host returns a 503. A connection pool is briefly exhausted because someone deployed. None of these are worth waking anyone up for, and all of them are fixed by trying again in a bit.
+
+So the default in goque is: return an error, and the job runs again later.
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[DeliverWebhook]) error {
+	resp, err := http.Post(job.Args.URL, "application/json", body)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode >= 500 {
+		return fmt.Errorf("endpoint %s returned %d", job.Args.EndpointID, resp.StatusCode)
+	}
+	return nil
+})
+```
+
+There is nothing else to wire up. That error is what drives everything on this page.
+
+## What one failure costs
+
+When `Work` returns a non-nil error, four things happen:
+
+1. The failure is appended to the job's **error history** — the time, which attempt it was, and the message. Nothing is overwritten, so a job that fails eight times carries eight records.
+2. `Config.ErrorHandler` fires, if you set one. See [Error Handling](/configuration/errors).
+3. The job moves to `retryable`, scheduled for `now` plus whatever its retry policy says about the attempt that just failed.
+4. When that time arrives the mover makes it available again, and the next worker with a free slot claims it — not necessarily the same process, and not necessarily the same machine.
+
+Your worker can see where it is in that sequence, which is often all you need to decide how hard to try:
+
+```go
+if job.Attempt == job.MaxAttempts {
+	// last chance — fall back to the slow, expensive path
+}
+```
+
+`Attempt` starts at 1 for the first run. `MaxAttempts` is the total *including* that first run, so `WithMaxAttempts(3)` buys you one attempt and two retries.
+
+## When the attempts run out
+
+A job that fails on its last attempt does not disappear. It becomes **dead**: a terminal state that keeps the payload, the metadata, and every one of those error records with its attempt number and timestamp.
+
+```
+state:   dead
+attempt: 3 / 3
+errors:
+  attempt 1  crm unreachable: dial tcp: connection refused
+  attempt 2  crm unreachable: dial tcp: connection refused
+  attempt 3  crm unreachable: 503 Service Unavailable
+```
+
+This is deliberate. The most useful moment in a job's life is usually the moment it gives up, and a queue that deletes the evidence at exactly that moment is telling you to go read your logs instead.
+
+Dead jobs are retained for `Config.DeadRetention` — seven days by default — before the cleaner removes them.
+
+:::note
+Dead is not the same as cancelled. A job is dead when it *ran out of attempts*; it is cancelled when a worker deliberately stopped it with `goque.Cancel`. They have separate retentions and they mean genuinely different things when you go looking. [Lifecycle & Guarantees](/reference/guarantees) lays out every state.
+:::
+
+## The built-in policies
+
+A retry policy is one method — given the number of the attempt that just failed, how long until the next one. Four implementations ship with the library.
+
+### Exponential
+
+```go
+goque.Exponential{Base: 2 * time.Second, Max: 15 * time.Minute, Jitter: 0.1}
+```
+
+`Base` is the wait after the first failure; each subsequent failure doubles it; `Max` caps the doubling; `Jitter` spreads the result.
+
+This is the default policy, and the one you want unless you have a reason otherwise — it retries fast enough to ride out a blip and slowly enough to stop hammering something that is genuinely down.
+
+| Attempt that failed | Delay |
+| --- | --- |
+| 1 | 2s |
+| 2 | 4s |
+| 3 | 8s |
+| 4 | 16s |
+| 5 | 32s |
+| 6 | 1m 4s |
+| 7 | 2m 8s |
+| 8 | 4m 16s |
+| 9 | 8m 32s |
+| 10 and beyond | 15m |
+
+With the default 25 attempts, that curve spans a little over four hours before the job dies — roughly twenty minutes of eager retrying followed by a quarter-hourly heartbeat for the rest of the afternoon. A `Max` of zero means uncapped, which with exponential growth gets absurd quickly; set one.
+
+### Linear
+
+```go
+goque.Linear{Step: 30 * time.Second, Max: 10 * time.Minute}
+```
+
+The delay is `attempt × Step`, capped at `Max`: 30s, 1m, 1m30s, 2m, and so on up to the ceiling. It backs off gently rather than abandoning the dependency after a few tries, which suits an internal service you expect back within minutes and want to keep probing at a steady, predictable rate.
+
+### Fixed
+
+```go
+goque.Fixed{Interval: time.Minute}
+```
+
+The same wait before every attempt, regardless of how many have failed. Honest and boring. Use it when the thing you are waiting on has its own cadence — a batch that lands every minute, a partner that clears its queue on a timer — and backing off further just means arriving later than you needed to.
+
+### Intervals
+
+```go
+goque.Intervals{10 * time.Second, time.Minute, 5 * time.Minute, 30 * time.Minute, 2 * time.Hour}
+```
+
+An explicit schedule, one entry per attempt: 10s after the first failure, a minute after the second, and so on. When someone has opinions about the retry schedule — a partner's integration guide, an SLA, a postmortem action item — this is how you write those opinions down without translating them into a curve first.
+
+**Attempts past the end of the list repeat the last entry.** With the five entries above and `WithMaxAttempts(8)`, the sixth and seventh failures each wait two hours; the eighth exhausts the budget, so that job goes dead instead of waiting again. The list sets the shape of the ramp; `MaxAttempts` sets how long it goes on.
+
+An empty `Intervals` retries immediately, every time, which is almost never what you want.
+
+## Jitter, and why it exists
+
+Everything above is deterministic, and determinism is a liability at exactly the moment retries matter most.
+
+Picture a dependency that goes down for ninety seconds. Four thousand jobs fail within a second of each other, and with a deterministic curve all four thousand retry within a second of each other — over and over, in lockstep, every wave landing on the recovering service in one spike.
+
+The service that was about to come back gets knocked over by your retries. That is a thundering herd, and it is a genuinely common way to turn a brief outage into a long one.
+
+`Jitter` breaks up the wave by randomizing each delay independently:
+
+```go
+goque.Exponential{Base: 2 * time.Second, Max: 15 * time.Minute, Jitter: 0.1}
+```
+
+`0.1` spreads the computed delay uniformly across 90% to 110% of its value, so the four thousand jobs arrive smeared across a window instead of stacked on one instant. The default policy sets it for you.
+
+If you write your own `Exponential`, set it too — 0.1 to 0.3 is a sensible range, and higher values are for when you have a lot of identical jobs failing together.
+
+:::warning[Jitter is applied after the Max cap]
+The order is: double, clamp to `Max`, *then* jitter. That means a jittered delay can exceed `Max` by up to the jitter fraction — `Max: 15m` with `Jitter: 0.1` produces waits of up to about 16m30s.
+
+`Max` is a cap on the doubling, not a hard ceiling on the delay. If you need a genuine upper bound, set `Max` a little below it or use `Intervals`.
+:::
+
+Only `Exponential` has a `Jitter` field. `Linear`, `Fixed`, and `Intervals` return exactly what you asked for.
+
+## Setting a policy
+
+Per job, when this one is special:
+
+```go
+client.Enqueue(ctx, DeliverWebhook{EndpointID: "ep_31"},
+	goque.WithMaxAttempts(8),
+	goque.WithRetryPolicy(goque.Intervals{
+		10 * time.Second,
+		time.Minute,
+		5 * time.Minute,
+		30 * time.Minute,
+		2 * time.Hour,
+	}),
+)
+```
+
+Or as the client's default, when it is your house style:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Defaults: goque.JobOptions{
+		MaxAttempts: 10,
+		RetryPolicy: goque.Exponential{Base: 5 * time.Second, Max: 30 * time.Minute, Jitter: 0.2},
+	},
+})
+```
+
+A job kind can also carry one in its `JobOptions()` method, which is usually the right home for "webhooks retry like *this*". The three layers resolve most-specific-first, exactly as described in [Job Options](/configuration/options).
+
+## Custom curves
+
+Sooner or later you want a shape that no struct describes — back off exponentially but never across a maintenance window, or wait until business hours, or scale the delay by the tenant's plan. You cannot simply pass a function:
+
+```go
+client.Enqueue(ctx, SyncContact{ContactID: "c_1"},
+	goque.WithRetryPolicy(myCleverPolicy{}))
+// error: goque: unencodable retry policy main.myCleverPolicy
+```
+
+That error looks unfriendly until you know why it is there. **The retry policy is serialized onto the job row.**
+
+It has to be: the process that enqueued a job is frequently not the process that retries it, and the one that retries it three hours from now may have been deployed since. Storing the curve with the job is what makes every process agree on the backoff.
+
+And a Go function pointer cannot be written to a database row — but a *name* can.
+
+So you register the function once and refer to it by name:
+
+```go [main.go]
+goque.RegisterRetryPolicy("business-hours", func(attempt int) time.Duration {
+	next := time.Now().Add(time.Duration(attempt) * 10 * time.Minute)
+	if h := next.Hour(); h < 9 || h >= 17 {
+		return time.Until(nextWeekdayAt(next, 9))
+	}
+	return time.Duration(attempt) * 10 * time.Minute
+})
+```
+
+```go
+client.Enqueue(ctx, SyncContact{ContactID: "c_1"},
+	goque.WithRetryPolicy(goque.Named{Name: "business-hours"}))
+```
+
+The row stores `{"type":"named","name":"business-hours"}` and nothing else. Register at start-up, before anything can decode a job that refers to the name, and register the *same* name in every process that might run these jobs — the name is the contract between them.
+
+:::note
+A process that does not recognise a name does not fail the job: it falls back to the client's default retry policy for that attempt. That keeps a partial deploy from turning into an outage, at the cost of a quietly wrong backoff, so it is worth alerting on rather than relying on.
+:::
+
+## Overriding a single attempt
+
+Everything above sets the curve for the *whole* job. Sometimes a single failure knows better than the curve does — a `429` response carrying a `Retry-After` header knows exactly when to come back, and no amount of exponential guessing improves on that.
+
+And sometimes the job hasn't failed at all; it is just waiting on something that isn't ready yet, and burning an attempt for that would be wrong.
+
+Those are `goque.RetryAt` and `goque.SnoozeFor`, and they are covered in [Error Handling](/configuration/errors).
+
+## Next steps
+
+- **[Error Handling](/configuration/errors)** — cancelling, snoozing, overriding one attempt's timing, and the panic path.
+- **[Job Options](/configuration/options)** — how a policy set on the kind, the client, and the enqueue resolve against each other.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — `retryable`, `dead`, retention, and what at-least-once means for a retrying job.
+- **[Testing Patterns](/testing/patterns)** — driving a job through its whole retry curve without waiting for it.

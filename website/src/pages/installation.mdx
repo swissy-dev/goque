@@ -1,0 +1,114 @@
+---
+title: Installation
+description: Add goque to your Go project.
+---
+
+# Installation
+
+goque requires **Go 1.24 or newer** — it leans on generics for typed jobs, which is what keeps the API free of reflection.
+
+```bash
+go get github.com/swissy-dev/goque
+```
+
+goque imports nothing outside the standard library, so this adds one line to your `go.mod` and no transitive dependencies to audit.
+
+:::warning[Private module]
+`swissy-dev/goque` is a private repository, so the Go module proxy cannot fetch it. Tell the toolchain to bypass the proxy and checksum database, and give git a credential it can use:
+
+```bash
+go env -w GOPRIVATE=github.com/swissy-dev/*
+git config --global url."git@github.com:".insteadOf "https://github.com/"
+```
+
+The first line is the one that matters — without it `go get` fails with a `410 Gone` from `proxy.golang.org`. The second makes git use your SSH key; a `~/.netrc` with a personal access token works too. In CI, set `GOPRIVATE` in the environment and provide a token with read access to the org.
+:::
+
+## What you just installed
+
+The module is organised into a few small packages, and you will usually import only the first two.
+
+| Package | What it is for |
+| --- | --- |
+| `github.com/swissy-dev/goque` | The client, jobs, workers, options, and the test fake. This is the one you import everywhere. |
+| `github.com/swissy-dev/goque/backend/memory` | The in-memory backend. You construct one and hand it to the client. |
+| `github.com/swissy-dev/goque/middleware` | Optional middleware: logging, metrics hooks, panic recovery. |
+| `github.com/swissy-dev/goque/backend` | The backend contract and job row types. You need this only to write your own backend. |
+| `github.com/swissy-dev/goque/backendtest` | A conformance suite for testing a backend you wrote yourself. |
+
+A typical file imports two of them:
+
+```go
+import (
+	"github.com/swissy-dev/goque"
+	"github.com/swissy-dev/goque/backend/memory"
+)
+```
+
+## Choosing a backend
+
+A backend is where jobs live. Today there is one:
+
+**`memory`** keeps jobs in the process that created them. Nothing is written to disk, and nothing is shared with other processes. It is complete, fully tested, and genuinely the right choice for tests, for CLI tools, and for single-binary applications that run their own workers.
+
+:::warning
+Because the in-memory backend does not outlive its process or reach across processes, jobs are lost on restart and a separate worker fleet cannot see them. If you need durability or multiple processes, you need one of the database backends on the [Roadmap](/reference/roadmap) — they are specified but not yet built.
+:::
+
+## Verify it works
+
+Drop this in a file and run it. If it prints, you are ready for the [Quick Start](/quick-start).
+
+```go [main.go]
+package main
+
+import (
+	"context"
+	"fmt"
+
+	"github.com/swissy-dev/goque"
+	"github.com/swissy-dev/goque/backend/memory"
+)
+
+type Ping struct {
+	Message string `json:"message"`
+}
+
+func (Ping) Kind() string { return "ping" }
+
+type PingWorker struct {
+	goque.WorkerDefaults[Ping]
+}
+
+func (w *PingWorker) Work(ctx context.Context, job *goque.Job[Ping]) error {
+	fmt.Println("got:", job.Args.Message)
+	return nil
+}
+
+func main() {
+	workers := goque.NewWorkers()
+	goque.Register(workers, &PingWorker{})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		panic(err)
+	}
+
+	ctx := context.Background()
+	if _, err := client.Enqueue(ctx, Ping{Message: "goque is installed"}); err != nil {
+		panic(err)
+	}
+
+	if _, err := client.ProcessReady(ctx, "default"); err != nil {
+		panic(err)
+	}
+}
+```
+
+```
+got: goque is installed
+```
+
+:::note
+This example uses [`ProcessReady`](/running/one-shot), which runs everything currently due and then returns — no background goroutines, no waiting. It keeps the example finite and honest. In a real application you would normally call `Start` instead and let workers run continuously, which the [Quick Start](/quick-start) shows.
+:::

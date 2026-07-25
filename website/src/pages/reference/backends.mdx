@@ -1,0 +1,181 @@
+---
+title: Backends
+description: The storage and coordination layer behind the client — the contract, the in-memory implementation, and how to write and verify your own.
+---
+
+# Backends
+
+Everything a client does that outlives a function call goes through a backend. Storing a job, handing it to exactly one worker, recording how the attempt ended, noticing that a worker died — all of it is the backend's job.
+
+The client decides *what* should happen; the backend makes it stick. That split is why goque has a `backend.Backend` interface rather than a database. Swap the implementation and the rest of the library does not change: the same executor, the same retry policies, the same middleware, the same tests.
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+```
+
+The first argument is the whole storage layer.
+
+## What the contract asks for
+
+`backend.Backend` is eleven methods in five groups. Read them as groups rather than as a list of signatures.
+
+Every method carries its full contract as a doc comment. Run `go doc github.com/swissy-dev/goque/backend Backend` for the authoritative text.
+
+**Getting jobs in.** `Enqueue` stores a batch of rows and fills each one in:
+
+- assigns an ID;
+- stamps `CreatedAt`;
+- defaults an unset `ScheduledAt` to now;
+- sets the state to `available` or `scheduled`, depending on whether that time has arrived;
+- derives `PriorityAt` from `ScheduledAt` minus the priority boost.
+
+It updates the caller's rows in place, which is how `Enqueue` can hand you back the assigned ID.
+
+**Getting jobs out.** `Fetch` is the single most important method in the library. It claims up to `Limit` due jobs from one queue.
+
+The claim must be **atomic and exclusive**: the selection and the state change happen as one indivisible operation, so a job is delivered to exactly one worker no matter how many processes are fetching at the same moment.
+
+A claim moves the row to `running`, increments `Attempt` and `Generation`, stamps `AttemptedAt` and `HeartbeatAt`, and appends the claiming `ClientID` to `AttemptedBy`. Rows come back ordered by `PriorityAt` then ID, as copies. An empty result means there is no work — not an error.
+
+**Recording how an attempt ended.** Five methods, one per outcome: `Complete`, `Retry`, `Cancel`, `Kill`, and `Snooze`.
+
+Every one of them is **fenced**: an entry applies only to a row matching its ID *and* its generation *and* still in `running`.
+
+A stale execution — one whose job was rescued out from under it — fails the check and is reported through `*backend.StaleError`, which unwraps to `backend.ErrStaleAttempt`. Unmatched entries never block the rest of a batch from applying.
+
+The five differ in what they do to the row beyond the state change:
+
+| Method | What else it does to the row |
+| --- | --- |
+| `Retry` | Appends the failure and moves `ScheduledAt` to the backoff time. |
+| `Kill` | Appends the final failure and sets `FinalizedAt`. |
+| `Cancel` | Sets `FinalizedAt` and records a reason if one was given. |
+| `Snooze` | Moves `ScheduledAt` and **gives back the attempt the claim spent** — no error recorded, `Generation` untouched. |
+
+That last row is precisely why the two counters are separate. See [Lifecycle & Guarantees](/reference/guarantees).
+
+**Reporting liveness.** `Heartbeat` renews the lease on a batch of running executions, stamping `HeartbeatAt` — again only on rows matching both the ID and the generation, so a superseded execution cannot keep a reclaimed job alive. It returns which of the renewed jobs have been asked to cancel, which is the delivery path for remote cancellation.
+
+**Maintenance.** Three operations the client drives on timers:
+
+- `MoveDue` promotes scheduled and retryable jobs whose time has come to `available`.
+- `RescueStale` returns running jobs whose heartbeat is older than the TTL to `retryable`.
+- `Clean` deletes terminal jobs past their retention.
+
+All three must be **idempotent and safe to run concurrently from several processes** — each job counts for exactly one caller — because in a real deployment every instance will be running them.
+
+Two conventions run through the whole interface. Every method takes its parameters as a struct, so the contract can grow without breaking third-party implementations.
+
+And every one of those structs carries a `Now time.Time`: **a backend never reads the wall clock itself.** That is what lets the entire library be driven by a simulated clock in tests, and it is not optional — the conformance suite fails a backend that calls `time.Now()` behind your back.
+
+## The in-memory backend
+
+Today there is one implementation, in `backend/memory`. It keeps jobs in a `map[int64]*JobRow` guarded by a mutex.
+
+```go
+import "github.com/swissy-dev/goque/backend/memory"
+
+b := memory.New()
+```
+
+It is safe for concurrent use and it is genuinely complete — it implements every method, upholds every guarantee, and passes the conformance suite. Claiming really is exclusive, fencing really works, rescue really happens. Within one process it behaves exactly like a real backend, which is what makes it trustworthy for tests.
+
+The limits are equally real, and all three follow from the same fact — the jobs live in your process's heap:
+
+- **Process-local.** A job enqueued by your web server is invisible to a worker process running the same binary somewhere else. There is no shared store to look at.
+- **Lost on restart.** A deploy, a crash, or an OOM kill takes the queue with it. Nothing is written anywhere.
+- **Not observable from outside.** No `psql`, no `redis-cli`, no dashboard. If you want to know what is queued, you have to ask the running process.
+
+**Right choice for:** tests, local development, and a single-process application that can afford to lose queued work on restart — a CLI that fans out work across goroutines, a desktop application, a service whose jobs are all "nice to have by tomorrow" and are re-derivable from your own database.
+
+**Wrong choice for:** handing work from a web tier to a worker fleet, or anything you would be upset to lose. Durable backends are [on the roadmap](/reference/roadmap).
+
+### Test helpers
+
+The memory backend exposes four methods beyond the interface, for tests:
+
+| Method | Use |
+| --- | --- |
+| `Snapshot(id)` | A copy of one stored row, or `nil`. |
+| `SnapshotAll()` | Copies of every row, ordered by ID, including finalized ones. |
+| `Reset()` | Delete every job. IDs keep counting, so they are never reused. |
+| `SetCancelRequested(id)` | Flag a job as asked to stop, so the next heartbeat reports it. |
+
+The snapshots are copies, so reading them while the backend is busy is safe and mutating them changes nothing.
+
+`Client.Fake` is built on `Snapshot`, `SnapshotAll`, and `Reset`: `f.Job(id)`, `f.AssertPending(n)`, and `f.Reset()` are those three methods with assertions attached. Most of the time you want the fake rather than the backend directly. See [Testing Jobs](/testing).
+
+`SetCancelRequested` stands in for the remote cancellation API that does not exist yet. It exists so the cancellation delivery path — flag on the row, reported by `Heartbeat`, worker's context cancelled — can be tested end to end before there is a public way to request one.
+
+## Writing your own
+
+Implementing `backend.Backend` is a real piece of work, but it is bounded: eleven methods, no callbacks into the library, no interaction with the executor.
+
+The hard parts are not the SQL — they are the concurrency rules:
+
+- an atomic claim under contention;
+- a CAS that rejects a stale generation;
+- maintenance operations that several processes can run at once without double-counting.
+
+Those are exactly the things that look correct in review and fail once a quarter in production, which is why goque ships a conformance suite instead of a prose specification.
+
+```go [mybackend_test.go]
+package mybackend
+
+import (
+	"testing"
+
+	"github.com/swissy-dev/goque/backend"
+	"github.com/swissy-dev/goque/backendtest"
+)
+
+func TestConformance(t *testing.T) {
+	backendtest.Run(t, func(t *testing.T) backend.Backend {
+		return New()
+	})
+}
+```
+
+That is the whole integration. `Run` calls your factory once per subtest and expects an empty backend each time; if yours owns a resource — a database, a container, a temp file — clean it up with `t.Cleanup` inside the factory.
+
+Every check is a named subtest, so a failure names the rule you broke rather than making you go looking.
+
+### What the suite verifies
+
+- **Enqueue fills the row** — IDs assigned and unique, `CreatedAt` stamped from `Now`, the right initial state for a due job versus a future one, `PriorityAt` derived correctly.
+- **Claim exclusivity** — a claimed job cannot be claimed again, and the claim sets every field it is supposed to.
+- **Claim exclusivity under concurrency** — ten goroutines race to claim two hundred jobs; every job must be delivered exactly once.
+- **Effective-time ordering** — a boosted job scheduled *later* must still be fetched first, and fetch must skip other queues and not-yet-due jobs.
+- **Generation fencing on every finalization** — a stale generation must fail with `ErrStaleAttempt`, a double-complete must fail, and a valid finalization must still succeed.
+- **A replayed snooze** — the case that makes `Attempt` and `Generation` separate counters: after a snooze and a reclaim, re-sending the original snooze must be rejected while the live execution can still finalize.
+- **Finalization after a rescue** — the rescued execution's late write must be fenced out, and the re-claim must show attempt 2, generation 2.
+- **Attempt accounting** — retry consumes an attempt and appends the error; snooze consumes neither; kill and cancel are terminal and the job is never fetched again.
+- **Heartbeat scoping** — renewal touches only the live running execution, an unknown ID is ignored rather than erroring, and a stale heartbeat must not keep a reclaimed job alive or prevent its rescue.
+- **Rescue TTL** — a job that heartbeated recently is not rescued; a silent one is.
+- **Mover idempotency under concurrency** — four callers moving fifty due jobs must report fifty in total, not two hundred.
+- **Cleaner retention and limit** — per-state retention measured from `FinalizedAt`, and `Limit` respected.
+
+All of it runs against the injectable `Now`, so there is nothing to wait for and nothing to flake.
+
+The suite is also the fastest way to understand the contract: when a subtest name is ambiguous, the test body is the specification.
+
+:::tip[Run it against the memory backend first]
+Before pointing the suite at your own implementation, run it against `memory.New()` and read the output. Sixteen subtest names, all passing, is a short and precise summary of everything a backend has to get right.
+:::
+
+## What is not in the core interface
+
+The core contract deliberately stops at the eleven methods above. Everything else in the design — transactional enqueue, unique inserts, leader election, pause and resume, job listing, cluster-wide concurrency ceilings — is specified as an *optional capability interface* that a backend may additionally implement.
+
+The client checks once at construction and refuses to start if you configured a feature the backend cannot provide.
+
+None of those capabilities are implemented yet, and neither are the durable backends that would implement them.
+
+The reserved fields you will notice on `JobRow` — `ConcurrencyKey`, `ThrottleKey`, `DebounceKey`, `DebounceDeadline`, `Output` — belong to that future: a backend should store and return them, but nothing reads them today. See the [Roadmap](/reference/roadmap).
+
+## See also
+
+- **[Roadmap](/reference/roadmap)** — the Postgres, SQLite, and Redis backends, and what they unlock.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — the semantics the contract exists to uphold.
+- **[Testing Jobs](/testing)** — the fake, which is built on the memory backend.
+- **[The Client](/basics/client)** — what the client does with a backend once it has one.

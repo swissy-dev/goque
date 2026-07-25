@@ -1,0 +1,250 @@
+---
+title: Observability
+description: Logging, metrics, and error reporting for background jobs — plus an honest account of what goque does not give you yet.
+---
+
+# Observability
+
+Background jobs fail where nobody is looking. There is no user staring at a spinner, no 500 in your HTTP dashboard — just a job that quietly retried nineteen times overnight and went dead at 4am. The whole point of instrumenting a queue is to make that visible before somebody files a support ticket.
+
+goque gives you four seams for it: a logger, per-job logging middleware, metrics hooks, and two error-reporting callbacks. This page covers each, then says plainly what is still missing.
+
+## Config.Logger, and what goque logs itself
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues:  map[string]goque.QueueConfig{"default": {Concurrency: 10}},
+	Logger:  slog.Default(),
+})
+```
+
+`Config.Logger` is a `*slog.Logger` and defaults to `slog.Default()`. It receives the client's **operational** logging — the machinery talking about itself, not about your jobs.
+
+That distinction matters, because the list is short on purpose:
+
+| Level | Message | When |
+| --- | --- | --- |
+| `error` | `goque: fetch failed` | Claiming from a queue returned a backend error. Carries `queue`. |
+| `error` | `goque: heartbeat failed` | A heartbeat round trip failed. Carries a running `failures` count. |
+| `error` | `goque: heartbeat lost, self-fencing active executions` | Three consecutive heartbeat failures. |
+| `error` | `goque: maintenance failed` | The mover, rescuer, or cleaner errored. Carries `service`. |
+| `error` | `goque: finalization flush failed after retries` | The completer could not record outcomes after five backed-off retries. |
+| `warn` | `goque: dropping finalization from self-fenced execution` | A fenced execution tried to record a result. |
+| `debug` | `goque: stale finalization dropped` | A superseded attempt's write was rejected by the backend. |
+
+:::warning[goque does not log your jobs]
+Nothing in that table fires when a job runs, succeeds, or fails. A client with a logger configured and no middleware installed is **silent** through a million successful jobs and through a million failures.
+
+Per-job visibility is opt-in, and it is `middleware.Logger`.
+:::
+
+Two of those lines deserve an alert of their own:
+
+- **`heartbeat lost, self-fencing active executions`** — this process can no longer prove it is alive, so it has stopped trusting its own in-flight work. The jobs will be rescued and rerun elsewhere.
+- **`finalization flush failed after retries`** — work was done whose outcome never reached the backend, which is the exact circumstance that turns at-least-once into a visible duplicate.
+
+## Per-job logging
+
+```go
+WorkerMiddleware: []goque.Middleware{
+	middleware.Logger(slog.Default()),
+	middleware.Recovery(),
+},
+```
+
+`middleware.Logger` writes one line when a job starts and one when it ends — at info level on success, at error level with the error on failure. Every line carries `kind`, `queue`, `id`, and `attempt`; the closing ones add `duration`.
+
+```
+level=INFO msg="job start" kind=email.welcome queue=critical id=1841 attempt=1
+level=INFO msg="job done" kind=email.welcome queue=critical id=1841 attempt=1 duration=41.2ms
+level=ERROR msg="job error" kind=payment.capture queue=default id=1842 attempt=3 duration=2.01s err="upstream timeout"
+```
+
+Note `middleware.Logger` first and `middleware.Recovery()` last. That ordering is what makes a panicking job produce a `job error` line instead of a `job start` with nothing after it — see [Middleware](/running/middleware).
+
+For your own logging inside a worker, the embedded row is right there:
+
+```go
+goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[CapturePayment]) error {
+	log := slog.With(
+		"job_id", job.ID,
+		"kind", job.Kind,
+		"queue", job.Queue,
+		"attempt", job.Attempt,
+		"max_attempts", job.MaxAttempts,
+	)
+	log.InfoContext(ctx, "capturing payment", "order_id", job.Args.OrderID)
+	return capture(ctx, job.Args.OrderID)
+})
+```
+
+`Attempt` and `MaxAttempts` together are the field you will actually grep for: "attempt=1" is noise, "attempt=19 max_attempts=20" is an incident about to happen. And `job.Errors` holds the whole history — every previous failure with its timestamp, attempt number, message, and stack trace if it panicked:
+
+```go
+for _, prev := range job.Errors {
+	log.WarnContext(ctx, "previous attempt failed",
+		"attempt", prev.Attempt, "at", prev.At, "err", prev.Err)
+}
+```
+
+## Metrics
+
+`middleware.Hooks` is the intended integration point: a callback before the job and one after, with the duration and the returned error.
+
+The example below is Prometheus-shaped but depends on nothing — swap the two interfaces for `*prometheus.GaugeVec` and `*prometheus.HistogramVec` and the code is unchanged.
+
+```go [metrics.go]
+type Gauge interface {
+	Inc()
+	Dec()
+}
+
+type Histogram interface{ Observe(float64) }
+
+type GaugeVec interface{ WithLabelValues(labels ...string) Gauge }
+
+type HistogramVec interface{ WithLabelValues(labels ...string) Histogram }
+
+func jobMetrics(inFlight GaugeVec, duration HistogramVec) goque.Middleware {
+	return middleware.Hooks(middleware.HookFuncs{
+		Before: func(ctx context.Context, row *goque.JobRow) {
+			inFlight.WithLabelValues(row.Queue).Inc()
+		},
+		After: func(ctx context.Context, row *goque.JobRow, d time.Duration, err error) {
+			inFlight.WithLabelValues(row.Queue).Dec()
+			duration.WithLabelValues(row.Kind, outcomeLabel(row, err)).Observe(d.Seconds())
+		},
+	})
+}
+
+func outcomeLabel(row *goque.JobRow, err error) string {
+	switch {
+	case err == nil:
+		return "completed"
+	case row.Attempt >= row.MaxAttempts:
+		return "dead"
+	default:
+		return "failed"
+	}
+}
+```
+
+Three metrics fall out of that: an in-flight gauge by queue (is a lane saturated?), a duration histogram by kind (which job got slower?), and — because the histogram is labelled by outcome — a failure rate by kind, for free.
+
+`outcomeLabel` applies the same test the executor is about to apply: an attempt that failed with none left becomes dead. Install it like any other middleware, outside `Recovery()` so it also counts panics:
+
+```go
+WorkerMiddleware: []goque.Middleware{
+	middleware.Logger(slog.Default()),
+	jobMetrics(inFlightVec, durationVec),
+	middleware.Recovery(),
+},
+```
+
+:::note[The hook cannot see every outcome]
+`After` runs before the executor decides what to do, so `err != nil` means "this attempt did not return nil" — nothing finer. A `goque.SnoozeFor` waiting politely on a dependency, and a `goque.Cancel` deliberately stopping a job, both arrive as errors and both land in the `failed` bucket.
+
+If you need exact outcomes, `ProcessReady` reports them precisely — see [One-Shot Processing](/running/one-shot).
+:::
+
+Keep both callbacks fast. They run on the job's own goroutine, and a panic in either is recovered by the client and recorded as a failed attempt — a metrics bug should not fail your job, so do not let it.
+
+## Error reporting
+
+Two client-level callbacks send failures to Sentry, Rollbar, or wherever your exceptions live:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues:  map[string]goque.QueueConfig{"default": {Concurrency: 10}},
+
+	ErrorHandler: func(ctx context.Context, row *goque.JobRow, err error) {
+		sentry.CaptureException(err, sentry.Tags{
+			"job.kind":    row.Kind,
+			"job.queue":   row.Queue,
+			"job.attempt": strconv.Itoa(row.Attempt),
+		})
+	},
+
+	PanicHandler: func(ctx context.Context, row *goque.JobRow, recovered any, stack []byte) {
+		sentry.CaptureMessage(
+			fmt.Sprintf("panic in %s (job %d): %v\n%s", row.Kind, row.ID, recovered, stack),
+		)
+	},
+})
+```
+
+The signatures, exactly:
+
+```go
+ErrorHandler func(ctx context.Context, row *goque.JobRow, err error)
+PanicHandler func(ctx context.Context, row *goque.JobRow, recovered any, stack []byte)
+```
+
+They are narrower than they look, and knowing exactly when each fires saves you a puzzling gap in your error dashboard:
+
+| Situation | `ErrorHandler` | `PanicHandler` |
+| --- | --- | --- |
+| Worker returned an ordinary error, job will retry | called | — |
+| Worker returned an ordinary error, attempts exhausted | called | — |
+| Worker panicked | — | called |
+| Worker returned `goque.Cancel(err)` | — | — |
+| Worker returned `goque.SnoozeFor(d)` | — | — |
+| Worker returned `goque.RetryAt(t, err)`, job will retry | — | — |
+| Worker returned `goque.RetryAt(t, err)`, attempts exhausted | called | — |
+
+The two control-error rows are the interesting ones. `Cancel` and `SnoozeFor` are decisions, not failures — a job that cancels itself on invalid input should not page anybody. `RetryAt` is a *deliberate* reschedule, usually for a rate limit you already expect, so it stays quiet until it turns terminal.
+
+A panicking job goes to `PanicHandler` **instead of** `ErrorHandler`, never both. Whichever fires, the attempt is recorded with its message and, for panics, its stack; the job then retries under its normal policy or becomes dead.
+
+:::tip
+Report `dead` separately from `failed`. A job that failed once and will retry in two seconds is usually not worth an alert. A job that used all twenty-five attempts is the same event as a 500 that nobody saw, and deserves the same urgency. `row.Attempt >= row.MaxAttempts` inside `ErrorHandler` tells you which one you are looking at.
+:::
+
+## What to alert on
+
+Three signals cover most of what goes wrong:
+
+**Jobs reaching `dead`.** The clearest failure signal a queue produces: work that was supposed to happen and now never will. Alert on any non-zero rate, per kind. If a kind goes dead routinely, either its `MaxAttempts` is wrong or it should be cancelling instead.
+
+**A climbing retry rate.** Retries are normal; a rising *proportion* of them is an upstream dependency degrading before it fails outright. Watch failures over total executions by kind — the `outcomeLabel` histogram above gives you this directly.
+
+**Queue depth growing.** The signal that your workers are no longer keeping up. Depth is the one thing goque does not currently expose (see below), so derive it: count inserts in enqueue-side middleware, count executions in `Hooks.After`, and alert when inserts outrun executions for a sustained window.
+
+It is an approximation, and it is enough to catch the failure mode that matters — a queue whose arrival rate has quietly exceeded its service rate.
+
+Also worth a rule: `heartbeat lost, self-fencing active executions` and `finalization flush failed after retries` should page. Both mean the process has lost its grip on work it is holding.
+
+## What does not exist yet
+
+:::warning[No UI, no metrics endpoint, no dead-letter browser]
+goque has **no web UI**, **no built-in `/metrics` endpoint**, and **no dead-letter queue browser**. There is no built-in way to list dead jobs, inspect one, or retry it from an interface.
+
+The seams on this page are the whole story today: your logger, your metrics library through `Hooks`, your error reporter through the two handlers. They are enough to run a service — you assemble the dashboard yourself. A dead-letter browser is on the [Roadmap](/reference/roadmap).
+:::
+
+Inspecting stored jobs directly is likewise thinner than you might expect. The in-memory backend offers `Snapshot(id)` and `SnapshotAll()`, which return copies of stored rows:
+
+```go
+b := memory.New()
+client, err := goque.NewClient(b, cfg)
+
+dead := 0
+for _, row := range b.SnapshotAll() {
+	if row.State == backend.StateDead {
+		dead++
+	}
+}
+```
+
+They are inspection helpers **for tests**, not a query API: they are specific to the memory backend, not part of the `backend.Backend` interface, and `SnapshotAll` copies every stored row on every call.
+
+Reach for them in a test, or in a diagnostic command on a small single-process deployment — not in a handler serving a dashboard. See [Backends](/reference/backends).
+
+## Next steps
+
+- **[Middleware](/running/middleware)** — chain ordering, and why `Recovery()` goes last.
+- **[Error Handling](/configuration/errors)** — control errors and what each one means.
+- **[Retries & Backoff](/configuration/retries)** — the curves behind your retry rate.
+- **[Roadmap](/reference/roadmap)** — the UI, the dead-letter browser, and what else is coming.

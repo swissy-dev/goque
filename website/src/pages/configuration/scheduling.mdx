@@ -1,0 +1,186 @@
+---
+title: Scheduling & Priority
+description: Delay a job until later with WithDelay or WithScheduledAt, and reorder the ones already waiting with a priority boost that cannot starve anything.
+---
+
+# Scheduling & Priority
+
+Two different questions hide behind the word "when". The first is *when does this job become eligible to run at all* — the trial reminder that should go out a fortnight from now, the webhook worth retrying in five minutes. The second is *given a pile of jobs that are all eligible right now, which one goes first*.
+
+goque answers them with two separate options, and it is worth keeping them separate in your head: `WithDelay` and `WithScheduledAt` decide eligibility, `WithPriority` decides order. A priority boost never makes a job run before its scheduled time.
+
+## Scheduling: when a job becomes eligible
+
+By default a job is eligible the moment it is stored. Two options move that forward.
+
+```go
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_8842"},
+	goque.WithDelay(14*24*time.Hour))
+```
+
+`WithDelay(d)` is relative to the enqueue: run this no earlier than `d` from now. It is the right shape when the interval is the point — retry a webhook in five minutes, warm the cache in an hour, chase the abandoned cart tomorrow.
+
+```go
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_8842"},
+	goque.WithScheduledAt(trial.EndsAt.Add(-3*24*time.Hour)))
+```
+
+`WithScheduledAt(t)` is absolute: run this no earlier than `t`. Reach for it when you already have the moment in hand — three days before this specific trial ends, at the start of the customer's next billing period, when the embargo lifts.
+
+Computing `time.Until(t)` and passing it to `WithDelay` gets you the same job with more chances to be wrong.
+
+They are mutually exclusive. Setting both fails the enqueue with an error wrapping `backend.ErrConflictingOptions` before anything is stored — see [Job Options](/configuration/options).
+
+### "No earlier than" is the whole promise
+
+Both options set an **earliest** run time. Neither is a guarantee that the job runs *at* that time, and treating them as one is the most common way to be disappointed by a job queue.
+
+Here is what actually happens:
+
+1. A job whose scheduled time is in the future is stored in the `scheduled` state, where no worker will look at it.
+2. A maintenance loop — the mover — runs on `Config.MoverInterval` (1 second by default) and promotes every scheduled job whose time has arrived into `available`.
+3. The next dispatch pass claims it, if there is free concurrency on its queue.
+
+So the minimum added latency is the mover's interval plus the poll cadence, and the maximum is however long your workers stay busy. A fourteen-day reminder landing a couple of seconds late is normal. A job scheduled for 09:00 on a queue that is saturated until 09:40 runs at 09:40.
+
+If you need something closer to a hard guarantee, give that work its own queue with spare concurrency rather than tightening the intervals. [Lifecycle & Guarantees](/reference/guarantees) has the full state machine.
+
+:::note
+Scheduling in the past is fine and is not an error. A job with a scheduled time that has already passed is simply available immediately, which makes `WithScheduledAt` safe to feed from a computed timestamp without clamping it yourself.
+:::
+
+### Testing the wait
+
+A fourteen-day delay is untestable if you have to live through it. Don't — move the clock instead:
+
+```go
+f := client.Fake(t)
+
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_8842"},
+	goque.WithDelay(14*24*time.Hour))
+
+f.RunReady(ctx).AssertNoneRan()
+
+f.Advance(14 * 24 * time.Hour)
+f.RunReady(ctx).AssertRan("email.trial-reminder")
+```
+
+`RunReady` promotes due jobs and runs them in one pass, so the promotion you would otherwise wait on the mover for happens synchronously. See [Testing Jobs](/testing).
+
+## Priority: a time boost, not a rank
+
+Now the second question. Ten thousand jobs are sitting in `default` and all of them are eligible. Which runs first?
+
+By default, the oldest — jobs are claimed in the order they became due. `WithPriority(d)` bends that:
+
+```go
+client.Enqueue(ctx, GenerateInvoice{InvoiceID: "in_4471"},
+	goque.WithPriority(3*time.Minute))
+```
+
+Read that as **"sort this as if it had been enqueued three minutes earlier"**, because that is literally what happens: the backend stores an effective sort time of `ScheduledAt` minus the boost, and claims jobs in order of that. It is not a rank, not a level, not a number from 1 to 9.
+
+Suppose it is 10:00:00 and four jobs are waiting on the same queue:
+
+| Job | Enqueued | Boost | Sorts as | Order |
+| --- | --- | --- | --- | --- |
+| `report.export` | 09:55:00 | — | 09:55:00 | 1st |
+| `billing.invoice` | 10:00:00 | 3m | 09:57:00 | 2nd |
+| `email.welcome` | 09:58:00 | — | 09:58:00 | 3rd |
+| `image.resize` | 10:00:00 | — | 10:00:00 | 4th |
+
+The boosted invoice jumps ahead of the welcome email, which has been waiting two minutes — and does not jump the report, which has been waiting five. That is the model in one table: a three-minute boost beats everything queued in the last three minutes, and nothing older.
+
+Two things follow from this, and they are the reason the design is worth the paragraph.
+
+### The units are ones you already have
+
+"How urgent is this invoice?" is an impossible question. "How long is it acceptable for this invoice to sit behind other work?" is a question your product manager can answer, and it is the same question.
+
+If the answer is "it should skip ahead of anything from the last few minutes", you write `3 * time.Minute` and you are done.
+
+There is no scale to agree on across teams, no argument about whether the new feature deserves a 3 or a 4, and no re-tuning six months later when someone else's jobs have quietly all become priority 1.
+
+### Starvation is structurally impossible
+
+This is the real payoff. With classic numeric levels, a busy P1 stream starves P4 forever: as long as one P1 is waiting, no P4 is ever chosen, and "eventually" never arrives. Every queue system built that way ends up with a hand-rolled ageing hack bolted on to stop the low-priority tier from rotting.
+
+A time boost cannot do that, because a waiting job's effective age keeps growing on its own.
+
+Take an unboosted job enqueued at 10:00 and a continuous stream of jobs carrying a 3-minute boost. Any boosted job arriving after 10:03 sorts as 10:00 or later — behind the job that has been waiting.
+
+The boost buys a fixed head start, not permanent precedence, so the unboosted job is at worst three minutes late and then it runs. There is no ageing mechanism because there is nothing to fix.
+
+The trade you are making is that a boost is a *bounded* advantage. If you want work that genuinely always goes first, that is not a priority question — it is a capacity question, and the answer is a separate queue.
+
+### Boosting from the job's own data
+
+The most useful boosts are computed, not constant. A job kind can carry a `Priority() time.Duration` method that turns the arguments into a boost:
+
+```go
+type GenerateInvoice struct {
+	InvoiceID string `json:"invoice_id"`
+	Plan      string `json:"plan"`
+}
+
+func (GenerateInvoice) Kind() string { return "billing.invoice" }
+
+func (a GenerateInvoice) Priority() time.Duration {
+	switch a.Plan {
+	case "enterprise":
+		return 10 * time.Minute
+	case "pro":
+		return time.Minute
+	default:
+		return 0
+	}
+}
+```
+
+Now paying customers' invoices skip ahead of the free tier's without a second queue, a second job kind, or a single `WithPriority` at any call site — and free-tier invoices still run, three or ten minutes behind, because of the property above. The policy lives with the job, next to the fields it reads.
+
+:::tip
+`Priority()` is evaluated against the arguments you actually enqueued, so it can read any field on the struct. A per-call override is still available when the boost depends on something the arguments don't carry — `goque.WithPriority(d)` at the call site wins over the method.
+:::
+
+### Negative boosts deprioritize
+
+`WithPriority` takes a duration, and a duration can be negative:
+
+```go
+client.Enqueue(ctx, WarmCache{Region: "eu-west-1"},
+	goque.WithPriority(-5*time.Minute))
+```
+
+That sorts the job as if it had been enqueued five minutes *later* — behind everything currently waiting, and behind anything that arrives in the next five minutes. It is the right tool for genuinely background background work: cache warming, backfills, speculative precomputation.
+
+And it stays honest in the same way boosts do, because the penalty is fixed: five minutes after enqueue, the job is competing on equal terms again.
+
+## How this layers with queues
+
+Priority orders jobs **within** a queue. It says nothing about how a busy `images` queue competes with a busy `billing` queue for the process's worker slots — that is `QueueConfig.Weight`, and it is a separate mechanism:
+
+```go
+client, err := goque.NewClient(memory.New(), &goque.Config{
+	Workers: workers,
+	Queues: map[string]goque.QueueConfig{
+		"critical": {Concurrency: 5, Weight: 6},
+		"default":  {Concurrency: 10},
+		"bulk":     {Concurrency: 2},
+	},
+})
+```
+
+The rule of thumb is simple:
+
+- **Same kind of work, one matters more than the other?** Boost it.
+- **Different kinds of work that should not be able to crowd each other out at all** — user-facing emails versus an overnight export? Give them different queues and let weight arbitrate.
+
+[Queues & Concurrency](/running/queues) covers weights, strict priority, and concurrency limits.
+
+## Next steps
+
+- **[Queues & Concurrency](/running/queues)** — weights, worker slots, and separating urgent work from bulk work.
+- **[Retries & Backoff](/configuration/retries)** — the other thing that reschedules a job for later.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — the states a job moves through and what the mover actually promises.
+- **[Testing Jobs](/testing)** — advancing the clock instead of waiting for it.

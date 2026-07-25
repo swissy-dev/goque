@@ -1,0 +1,93 @@
+---
+title: Introduction
+description: A background job and scheduling library for Go — typed jobs, pluggable backends, per-job retry policies, and tests that never sleep.
+---
+
+# goque
+
+Almost every application eventually needs to do something later. Send the welcome email after the signup response has already gone out. Resize the image without making the upload wait. Retry the payment webhook that failed because someone else's server was having a bad afternoon.
+
+goque is a background job library for Go that handles the boring, difficult parts of that: claiming work exactly once, retrying with sensible backoff, surviving a worker that dies mid-job, and shutting down without dropping anything on the floor.
+
+There are only three pieces to learn. First, a job — a plain struct with a name:
+
+```go
+type SendWelcomeEmail struct {
+	UserID string `json:"user_id"`
+}
+
+func (SendWelcomeEmail) Kind() string { return "email.welcome" }
+```
+
+Second, a worker — a struct whose fields are whatever the work needs:
+
+```go
+type EmailWorker struct {
+	goque.WorkerDefaults[SendWelcomeEmail]
+	Mailer *Mailer
+}
+
+func (w *EmailWorker) Work(ctx context.Context, job *goque.Job[SendWelcomeEmail]) error {
+	return w.Mailer.SendWelcome(ctx, job.Args.UserID)
+}
+```
+
+Third, from anywhere in your application, one call:
+
+```go
+client.Enqueue(ctx, SendWelcomeEmail{UserID: user.ID})
+```
+
+That is the entire surface you need to be productive. Retries, priorities, queues, timeouts, and graceful shutdown all exist, but each is one option on that last line — reached for when a job actually needs it, not before.
+
+**[Get it running in two minutes →](/quick-start)**
+
+## What makes it different
+
+**Your jobs are typed.** Job arguments are ordinary Go structs and workers are generic, so the compiler checks your payloads. There is no `map[string]any` to guess your way through, no `[]byte` to unmarshal by hand, and no reflection in the dispatch path. Rename a field and the build tells you which workers to fix.
+
+**Every setting is per job.** Queue, priority, retry policy, timeout, error handling — all of it resolves for each individual job rather than being frozen onto a worker or a client. One urgent invoice can carry a different backoff curve than the thousand routine ones behind it, without a second worker type.
+
+**Tests don't sleep.** This is the part worth arriving for. Testing background work usually means `time.Sleep(2 * time.Second)` and hoping, or extracting your logic until the queue itself is never exercised. goque gives you a controllable clock instead:
+
+```go
+f := client.Fake(t)
+
+client.Enqueue(ctx, SendTrialReminder{UserID: "u_1"}, goque.WithDelay(24*time.Hour))
+
+f.RunReady(ctx).AssertNoneRan()
+
+f.Advance(24 * time.Hour)
+f.RunReady(ctx).AssertRan("email.trial-reminder")
+```
+
+No sleeps, no goroutines, no flakes — and the job runs through the real executor, with your real middleware and your real retry policy. It is not a mock of the queue; it is the queue, with the clock in your hand.
+
+**Zero dependencies.** The library and its test helpers import nothing outside the standard library. Adding goque to a project adds exactly one module to your `go.mod` and nothing to your dependency audit.
+
+## Correctness you don't have to think about
+
+Background jobs fail in ways that are annoying to discover in production, so goque takes positions on them up front.
+
+A job is claimed by exactly one worker, atomically. If a worker process dies mid-job, its heartbeat goes stale and the job is rescued and retried rather than lost. If that worker was merely *partitioned* — alive but unreachable, still chewing on the job — it cannot corrupt the attempt that replaced it: every state transition is fenced by a monotonic token, so the zombie's writes are rejected instead of applied.
+
+Shutdown drains rather than drops. `Stop` stops claiming new work, lets in-flight jobs finish, and keeps heartbeating the whole time so that other processes don't mistake a draining job for a dead one and run it twice.
+
+:::note
+Execution is **at-least-once**. Claiming is exactly-once, but a process that crashes after doing its work and before recording that fact will run that job again. Write idempotent workers — this is true of every job queue that survives crashes, and goque states it plainly rather than implying otherwise.
+:::
+
+## Where it fits today
+
+:::warning[Early days]
+The core engine, the in-memory backend, and the testing story are complete and tested. The Postgres, SQLite, and Redis backends — along with cron, unique jobs, and rate limiting — are designed but **not yet implemented**.
+
+The in-memory backend keeps jobs inside the process that enqueued them. That makes goque a good fit right now for single-process applications, for tests, and for anything that runs its workers in the same binary that creates the work. It is not yet the right choice for handing jobs from a web process to a separate worker fleet. See the [Roadmap](/reference/roadmap).
+:::
+
+## Where to go next
+
+- **[Installation](/installation)** — add goque to your project.
+- **[Quick Start](/quick-start)** — a complete working program in about thirty lines.
+- **[Defining Jobs](/basics/jobs)** — job kinds, arguments, and what survives serialization.
+- **[Testing](/testing)** — the fake clock, and why your job tests can stop sleeping.

@@ -1,0 +1,209 @@
+---
+title: Starting & Stopping
+description: What Start launches, why cancelling its context is not a shutdown, and how Stop drains in-flight jobs without losing them.
+---
+
+# Starting & Stopping
+
+A worker process spends almost all of its life doing one thing, so the interesting parts are the two seconds at each end. Getting the start wrong means jobs never run. Getting the stop wrong means a deploy — which is just a stop, several times a day — quietly loses or duplicates work.
+
+goque gives you three calls: `Start`, `Stop`, and `StopAndCancel`. This page is about what each one actually does.
+
+## Start
+
+```go
+if err := client.Start(ctx); err != nil {
+	return err
+}
+```
+
+`Start` returns as soon as the machinery is running. It does not block, and it does not run a job on your goroutine — everything below happens in background goroutines from here until you call `Stop`:
+
+| Goroutine | What it does |
+| --- | --- |
+| **Dispatcher** | Claims jobs from your queues, respecting `Concurrency`, `MaxWorkers`, and `Weight`, and starts one goroutine per claimed job. |
+| **Completer** | Batches finalizations — completed, retried, cancelled, dead, snoozed — back to the backend instead of writing one at a time. |
+| **Heartbeat loop** | Reports liveness for every running job, so other processes can tell "still working" from "died". |
+| **Mover** | Promotes scheduled and retryable jobs to available once their time has come. Runs every `MoverInterval` (default 1s). |
+| **Rescuer** | Reclaims jobs whose heartbeat went stale — the process that owned them died — making them retryable again. Runs every `HeartbeatInterval` (default 30s). |
+| **Cleaner** | Deletes finished jobs past their retention window. Runs every `CleanInterval` (default 1m). |
+
+`Start` refuses, with an error explaining which, when:
+
+- the client is **already started**;
+- the client is **still draining** from a previous `Stop` — wait for that drain to finish and you may start it again;
+- the client is **fake-driven** (`client.Fake(t)` took over its clock — the synchronous test driver and the background dispatcher are mutually exclusive by design);
+- there are **no `Config.Queues`** — that client is enqueue-only, and this is how the omission surfaces;
+- there are **no `Config.Workers`** — nothing could be dispatched.
+
+Those last two are worth checking rather than ignoring. A worker process that silently processed nothing is a much worse afternoon than one that failed to boot.
+
+## Cancelling Start's context is not a shutdown
+
+This is the single most common misreading of the lifecycle, so it gets its own section.
+
+:::danger[Cancelling ctx does not drain your jobs]
+Cancelling the context you passed to `Start` stops the client **claiming new work** and stops the **mover, rescuer, and cleaner**. That is all it does.
+
+Everything already in flight keeps going: running jobs run to completion, the heartbeat loop keeps renewing their heartbeats, and the completer stays up to record their outcomes. The client is not stopped, and its resources are not released.
+
+**You still have to call `Stop`.**
+:::
+
+That design is deliberate rather than an oversight. If cancellation killed in-flight jobs, every shutdown would abandon half-finished work in the `running` state, and the only thing standing between you and duplicate execution would be another process's rescuer noticing thirty seconds later.
+
+Instead, cancellation means exactly "claim nothing further" — a useful, narrow operation — and draining stays an explicit, bounded thing you ask for.
+
+The practical consequence: `Start(ctx)` and `Stop(ctx)` do not take *the same kind of* context. `Start`'s is a "keep working" signal. `Stop`'s is a deadline. Wiring the same cancelled context into both is the mistake at the end of this page.
+
+## Stop
+
+```go
+drainCtx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+defer cancel()
+
+if err := client.Stop(drainCtx); err != nil {
+	slog.Error("drain did not finish in time", "err", err)
+}
+```
+
+`Stop` is the graceful shutdown:
+
+1. It stops claiming new work and stops the maintenance loops.
+2. It waits for the jobs already in flight to finish **and** for their outcomes to reach the backend.
+3. It returns `nil` once that drain is done — or immediately, if the client was never started.
+
+### Heartbeats keep going for the whole drain
+
+That third bullet hides the load-bearing detail. Throughout the drain, the heartbeat loop stays alive and keeps renewing the heartbeat of every job still running.
+
+Consider what happens without it. Your process gets SIGTERM and stops heartbeating. It is still perfectly healthy, still ten seconds from finishing a batch of invoice emails.
+
+Meanwhile another process's rescuer is watching those jobs' `HeartbeatAt`, and after `RescueTTL` it concludes — correctly, by the only evidence it has — that the owner died. It makes the jobs retryable, another worker claims them, and your customer gets two invoices for one order.
+
+Keeping heartbeats alive during the drain is what makes "finishing normally" distinguishable from "died holding the job". It is why `Stop` costs a little more than setting a flag, and it is the difference between at-least-once with a rare duplicate and at-least-once with a duplicate on *every single deploy*.
+
+:::note
+The heartbeat loop deliberately runs on its own internal context rather than the one you passed to `Start`, which is exactly why cancelling that context does not compromise the drain.
+:::
+
+### The context is a deadline, not a cancellation signal
+
+The context you hand `Stop` bounds how long the drain may take. It is **not** propagated to your jobs as a "stop now" signal — a worker mid-flight does not see it and is not interrupted while the deadline holds.
+
+When the deadline does pass, `Stop` gives up waiting rather than hanging forever:
+
+- it cancels the contexts of the jobs still running, so a worker that respects `ctx` can return early;
+- it allows a brief grace period for them to do so;
+- it returns the context's error promptly, while a background goroutine keeps draining the rest.
+
+Losing patience therefore **interrupts** stragglers rather than abandoning them. An interrupted job returns an error, which is recorded as a failed attempt and retried under its own policy — nothing is dropped.
+
+And if the process exits before that background drain finishes, the jobs still running are the case heartbeats and the rescuer exist for: another process reclaims them once their heartbeat goes stale.
+
+:::warning
+`Stop` returning a deadline error means the client may still be settling when you get control back. Treat it as a signal that your drain window is too short for your slowest job, not as "shutdown complete".
+:::
+
+Choose the deadline from your slowest job and your orchestrator's patience, whichever is smaller.
+
+Kubernetes sends SIGKILL `terminationGracePeriodSeconds` after SIGTERM (30s by default), so a drain deadline longer than that is a fiction — raise the grace period first, then the deadline.
+
+## StopAndCancel
+
+When the process has to exit now and correctness is served better by retrying than by waiting:
+
+```go
+if err := client.StopAndCancel(ctx); err != nil {
+	slog.Error("shutdown", "err", err)
+}
+```
+
+`StopAndCancel` cancels every running job's context up front and then stops exactly as `Stop` does. A worker that respects `ctx` returns promptly; the attempt is recorded as a failure and the job is retried under its normal policy.
+
+This is a fine choice for jobs that are short, idempotent, and cheap to redo. It is a poor one for a two-hour report, where you have simply converted "finishes in ten minutes" into "starts over".
+
+## The canonical production shape
+
+Start, block on a signal, drain with a bounded deadline:
+
+```go [cmd/worker/main.go]
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"os/signal"
+	"syscall"
+	"time"
+
+	"github.com/swissy-dev/goque"
+	"github.com/swissy-dev/goque/backend/memory"
+)
+
+func main() {
+	if err := run(); err != nil {
+		slog.Error("worker exited", "err", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+	defer stop()
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{
+		Workers: registerWorkers(),
+		Queues: map[string]goque.QueueConfig{
+			"critical": {Concurrency: 10, Weight: 6},
+			"default":  {Concurrency: 20, Weight: 3},
+			"bulk":     {Concurrency: 5, Weight: 1},
+		},
+		MaxWorkers: 25,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := client.Start(context.Background()); err != nil {
+		return err
+	}
+	slog.Info("worker started")
+
+	<-ctx.Done()
+	slog.Info("signal received, draining")
+
+	drainCtx, cancel := context.WithTimeout(context.Background(), 25*time.Second)
+	defer cancel()
+	return client.Stop(drainCtx)
+}
+```
+
+Three things in there are deliberate:
+
+**`Start` gets `context.Background()`, not the signal context.** Passing the signal context would work, but it would mean SIGTERM stops the fetchers a few microseconds before `Stop` does anyway — no benefit, and it invites the belief that the signal alone shuts the client down. Keep the signal doing one job: unblocking `main`.
+
+**The drain context descends from `context.Background()`.** This is the trap:
+
+```go
+// Wrong: ctx is already cancelled, so this deadline has already passed.
+drainCtx, cancel := context.WithTimeout(ctx, 25*time.Second)
+```
+
+By the time you reach that line, the signal context is done. A timeout derived from a cancelled parent is cancelled at birth, so `Stop` would immediately conclude the drain had timed out, interrupt every running job, and return.
+
+You would have written `StopAndCancel` by accident — and only noticed in production, on a deploy, when jobs started retrying.
+
+**The deadline is shorter than the orchestrator's grace period.** Twenty-five seconds under a thirty-second SIGKILL leaves room for the process to actually exit.
+
+## In tests
+
+None of this applies to a faked client — `client.Fake(t)` refuses to `Start`, because the fake drives execution synchronously on your test goroutine and there is nothing to drain. Tests get determinism instead of a lifecycle. See [Testing Jobs](/testing), and [One-Shot Processing](/running/one-shot) for the same synchronous engine in production.
+
+## Next steps
+
+- **[Lifecycle & Guarantees](/reference/guarantees)** — states, fencing, rescue, and what at-least-once really costs.
+- **[One-Shot Processing](/running/one-shot)** — working a queue without a long-lived client at all.
+- **[Observability](/running/observability)** — knowing what your workers are doing while they run.
+- **[Queues & Concurrency](/running/queues)** — what the dispatcher is deciding between.

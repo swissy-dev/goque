@@ -1,0 +1,347 @@
+---
+title: Testing Patterns
+description: Recipes for the tests you actually write — HTTP handlers that enqueue, shared fixtures, parallel suites, cascades, dead jobs, cancel and snooze.
+---
+
+# Testing Patterns
+
+[Testing Jobs](/testing) covers the tools. This page is the recipes: complete, copyable tests for the situations that come up in a real suite. Each one assumes you already have a client and have called `client.Fake(t)` on it.
+
+## Testing an HTTP handler that enqueues
+
+This is the canonical case, and the one that pays for the whole feature. A signup endpoint creates the user, hands a welcome email to the queue, and returns — the request must not wait for SMTP.
+
+```go [app.go]
+type App struct {
+	mux   *http.ServeMux
+	queue *goque.Client
+}
+
+func NewApp(queue *goque.Client) *App {
+	a := &App{mux: http.NewServeMux(), queue: queue}
+	a.mux.HandleFunc("POST /signup", a.signup)
+	return a
+}
+
+func (a *App) ServeHTTP(w http.ResponseWriter, r *http.Request) {
+	a.mux.ServeHTTP(w, r)
+}
+
+func (a *App) signup(w http.ResponseWriter, r *http.Request) {
+	email := r.FormValue("email")
+	if _, err := a.queue.Enqueue(r.Context(), SendWelcomeEmail{To: email}); err != nil {
+		http.Error(w, "could not schedule welcome email", http.StatusInternalServerError)
+		return
+	}
+	w.WriteHeader(http.StatusCreated)
+}
+```
+
+The client is injected, so the test can hand it a faked one without the handler knowing or caring.
+
+```go [app_test.go]
+func TestSignupSchedulesWelcomeEmail(t *testing.T) {
+	var sent []string
+
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[SendWelcomeEmail]) error {
+		sent = append(sent, job.Args.To)
+		return nil
+	})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := client.Fake(t)
+	app := NewApp(client)
+
+	req := httptest.NewRequest("POST", "/signup", strings.NewReader("email=ada@example.com"))
+	req.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+	rec := httptest.NewRecorder()
+	app.ServeHTTP(rec, req)
+
+	// Phase one — the handler's contract.
+	if rec.Code != http.StatusCreated {
+		t.Fatalf("status = %d, want 201", rec.Code)
+	}
+	f.AssertPending(1)
+	if len(sent) != 0 {
+		t.Fatal("the handler must hand the email to the queue, not send it")
+	}
+
+	// Phase two — the worker's contract.
+	f.RunReady(context.Background()).AssertCompleted(1)
+	if len(sent) != 1 || sent[0] != "ada@example.com" {
+		t.Fatalf("sent = %v", sent)
+	}
+	f.AssertPending(0)
+}
+```
+
+**The two-phase split is the point.** Those are two different contracts and they fail for two different reasons.
+
+The handler's contract is *"the work was scheduled and the response came back fast."* The `len(sent) != 0` check is doing real work there: it fails the day somebody decides the email is quick enough to send inline, quietly putting an SMTP round trip on the signup path. `AssertPending(1)` is the positive half — the job exists and is waiting.
+
+The worker's contract is *"given that job, the right thing happens."* It runs only after you ask, at a moment you chose, so a failure in the mailer can never be mistaken for a failure in the handler.
+
+Between the two phases you can assert anything you like about the job that has not run yet:
+
+```go
+row := f.Job(1)
+if row.Queue != "email" {
+	t.Fatalf("welcome mail should go to the email queue, got %q", row.Queue)
+}
+```
+
+## Booting your app once
+
+Many suites build the whole application in `TestMain` — config, templates, a database pool, the worker registry — because building it per test is too slow. A goque client fits that shape fine; it just needs two lines per test.
+
+```go [main_test.go]
+var (
+	app    *App
+	client *goque.Client
+)
+
+func TestMain(m *testing.M) {
+	client = buildClient()	// expensive: config, pools, registry
+	app = NewApp(client)
+	os.Exit(m.Run())
+}
+
+func TestInvoiceIsGeneratedOvernight(t *testing.T) {
+	f := client.Fake(t)
+	t.Cleanup(f.Reset)
+
+	// ... the test
+}
+```
+
+Keeping the client in its own variable is what lets each test reach `Fake`; the `App` holds the same pointer for its handlers.
+
+Call `client.Fake(t)` at the top of *every* test. The first call installs the shared clock and starts tracking queues; later calls hand back a fresh handle bound to the calling test's `t`, leaving jobs and the clock exactly as they were.
+
+That rebinding is what matters: without it, a failed assertion in the fourth test would be reported against whichever `t` was passed first, and you would be reading a stack trace for the wrong test.
+
+`f.Reset()` between tests deletes every stored job, so the next test starts from an empty backend. Two things it deliberately does **not** do:
+
+- **It does not rewind the clock.** The clock stays monotonic for the whole run, because rewinding would make jobs enqueued after the reset sort ahead of ones enqueued before it. If a test needs a particular instant, set it explicitly with `f.SetNow(...)`.
+- **It does not keep discovered queues.** Tracked queues are re-seeded from `Config.Queues`, dropping the ones learned from earlier enqueues. Any queue you enqueue to afterwards is picked up again automatically; a queue whose rows arrive some other way — inserted straight into the backend, say — needs `f.TrackQueue("name")`.
+
+:::note
+`Reset` wipes jobs, not registrations. Workers, middleware, and defaults belong to the client you built once, which is exactly why booting once is worth doing.
+:::
+
+## Parallel tests
+
+A `Fake` and its client share one clock. Two tests running concurrently against the same client are two tests moving the same clock, and one of them will see time it did not ask for.
+
+So: **tests that share a client must run sequentially.** No `t.Parallel()`.
+
+```go [sequential_test.go]
+func TestDigestIsScheduled(t *testing.T) {
+	f := client.Fake(t)	// shared client from TestMain
+	t.Cleanup(f.Reset)
+	// no t.Parallel() here — the clock is shared
+
+	f.Advance(24 * time.Hour)
+	f.RunReady(context.Background()).AssertRan("email.digest")
+}
+```
+
+If you want parallelism, give each test its own client. Construction is a struct literal and a map copy — microseconds — so there is no reason to hoard one.
+
+```go [parallel_test.go]
+func newTestClient(t *testing.T) *goque.Client {
+	t.Helper()
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[SendWelcomeEmail]) error {
+		return nil
+	})
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return client
+}
+
+func TestWelcomeEmailInParallel(t *testing.T) {
+	t.Parallel()
+
+	client := newTestClient(t)
+	f := client.Fake(t)
+
+	client.Enqueue(context.Background(), SendWelcomeEmail{To: "ada@example.com"})
+	f.RunReady(context.Background()).AssertCompleted(1)
+}
+```
+
+Each test gets its own backend, its own clock, and its own job IDs starting at 1 — which incidentally makes `f.Job(1)` a reasonable thing to write.
+
+## A job that schedules another job
+
+Fan-out is common: one job discovers the work and enqueues a job per unit of it. `RunUntilIdle` runs the whole cascade in one call, without advancing the clock.
+
+```go [fanout_test.go]
+func TestMonthlyReportFansOutPerTenant(t *testing.T) {
+	var client *goque.Client
+	var built []string
+
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[BuildAllReports]) error {
+		for _, tenant := range []string{"acme", "globex", "initech"} {
+			if _, err := client.Enqueue(ctx, BuildReport{Tenant: tenant}); err != nil {
+				return err
+			}
+		}
+		return nil
+	})
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[BuildReport]) error {
+		built = append(built, job.Args.Tenant)
+		return nil
+	})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := client.Fake(t)
+
+	ctx := context.Background()
+	client.Enqueue(ctx, BuildAllReports{Month: "2026-07"})
+
+	res := f.RunUntilIdle(ctx, 5)
+
+	res.AssertCompleted(4)	// the parent plus one report per tenant
+	if len(built) != 3 {
+		t.Fatalf("built = %v", built)
+	}
+	f.AssertPending(0)
+}
+```
+
+`maxRounds` of 5 is generous for a cascade two levels deep. Keep it tight: if a change turns the fan-out into a loop, you want a failed test in a second rather than a hung run.
+
+Assert on outcomes and counts rather than on which round a job landed in. The rules are subtle: a job enqueued into a queue the current pass is still draining runs in that same pass, while a *retry* always waits for the next round, because a retryable job has to be promoted before it can be claimed again.
+
+`Round` is there when you genuinely need to prove ordering — most tests don't.
+
+:::warning[Cascades need `RunUntilIdle`, not `Advance`]
+Advancing time will not run a job that is already due; only a run does. And `RunReady` deliberately stops after one pass. If a cascade seems to lose jobs halfway, the usual cause is `RunReady` where `RunUntilIdle` was meant.
+:::
+
+## Testing the dead path
+
+A job that fails forever should end up dead, with its error history intact — not retried in perpetuity, and not silently discarded. Pin a fixed backoff and a small attempt budget, and the whole life story fits in a dozen lines.
+
+```go [dead_test.go]
+func TestWebhookGoesDeadAfterThreeAttempts(t *testing.T) {
+	workers := goque.NewWorkers()
+	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[DeliverWebhook]) error {
+		return errors.New("connection refused")
+	})
+
+	client, err := goque.NewClient(memory.New(), &goque.Config{Workers: workers})
+	if err != nil {
+		t.Fatal(err)
+	}
+	f := client.Fake(t)
+
+	ctx := context.Background()
+	res, err := client.Enqueue(ctx, DeliverWebhook{URL: "https://example.com/hook"},
+		goque.WithMaxAttempts(3),
+		goque.WithRetryPolicy(goque.Fixed{Interval: time.Minute}))
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	f.RunReady(ctx).AssertRetried(1)
+	f.Advance(time.Minute)
+	f.RunReady(ctx).AssertRetried(1)
+	f.Advance(time.Minute)
+	f.RunReady(ctx).AssertDead(1)
+
+	f.AssertState(res.Job.ID, backend.StateDead)
+	f.AssertPending(0)
+
+	row := f.Job(res.Job.ID)
+	if len(row.Errors) != 3 {
+		t.Fatalf("kept %d attempt errors, want 3", len(row.Errors))
+	}
+	if !strings.Contains(row.Errors[2].Err, "connection refused") {
+		t.Fatalf("last error = %q", row.Errors[2].Err)
+	}
+}
+```
+
+Two assertions here are worth keeping in your own version. `AssertPending(0)` proves the job stopped — dead is terminal, so a dead job is not pending. And the check on `row.Errors` proves the failure history survived, which is what makes a dead job debuggable a day later instead of just gone.
+
+The same shape tests a panicking worker: a panic is recovered, recorded as a failed attempt with its stack trace on `row.Errors[i].Stack`, and retried under the job's normal policy.
+
+## Testing cancel and snooze
+
+`Cancel` and `SnoozeFor` are the two outcomes people forget to test, and both are easy to get backwards. Here is a worker that uses each for its proper purpose — cancel when the work has become pointless, snooze when it is merely too early.
+
+```go [charge.go]
+func (w *ChargeWorker) Work(ctx context.Context, job *goque.Job[ChargeInvoice]) error {
+	inv, err := w.Store.Invoice(ctx, job.Args.InvoiceID)
+	if err != nil {
+		return err
+	}
+	if inv.Void {
+		return goque.Cancel(errors.New("invoice was voided"))
+	}
+	if !inv.PaymentMethodReady {
+		return goque.SnoozeFor(15 * time.Minute)
+	}
+	return w.Gateway.Charge(ctx, inv)
+}
+```
+
+Cancel is terminal and ignores the remaining attempt budget entirely, which is exactly the assertion to write:
+
+```go
+res, _ := client.Enqueue(ctx, ChargeInvoice{InvoiceID: voided.ID}, goque.WithMaxAttempts(25))
+
+f.RunReady(ctx).AssertCancelled(1)
+
+f.AssertState(res.Job.ID, backend.StateCancelled)
+f.AssertPending(0)
+
+// Twenty-four attempts left, and it still never runs again.
+f.Advance(24 * time.Hour)
+f.RunReady(ctx).AssertNoneRan()
+```
+
+Snooze is the opposite: the job comes back, and it comes back with its attempt budget untouched. That last part is the one to prove, because snoozing in a loop must never march a job towards dead.
+
+```go
+res, _ := client.Enqueue(ctx, ChargeInvoice{InvoiceID: pending.ID})
+
+f.RunReady(ctx).AssertSnoozed(1)
+f.AssertState(res.Job.ID, backend.StateRetryable)
+
+// Too early — the snooze has not elapsed.
+f.RunReady(ctx).AssertNoneRan()
+
+paymentMethod.Ready = true
+f.Advance(15 * time.Minute)
+f.RunReady(ctx).AssertCompleted(1)
+
+// It ran twice, but only ever spent one attempt.
+if row := f.Job(res.Job.ID); row.Attempt != 1 {
+	t.Fatalf("attempt = %d, want 1", row.Attempt)
+}
+```
+
+Note `AssertState(..., backend.StateRetryable)` for a snoozed job. Snooze and retry both park a job in `retryable` — the difference is invisible in the state and very visible in the counters: no error is recorded and the attempt is handed back.
+
+That is why `AssertSnoozed` and `AssertRetried` are separate assertions, and why asserting only on state would let a bug through.
+
+## Next steps
+
+- **[Testing Jobs](/testing)** — the full API behind these recipes, and what the fake does not simulate.
+- **[Error Handling](/configuration/errors)** — `Cancel`, `SnoozeFor`, and `RetryAt` in production.
+- **[Retries & Backoff](/configuration/retries)** — choosing the policy your tests pin.
+- **[Lifecycle & Guarantees](/reference/guarantees)** — what `retryable`, `dead`, and `cancelled` mean.

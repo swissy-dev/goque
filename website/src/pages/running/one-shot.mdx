@@ -1,0 +1,210 @@
+---
+title: One-Shot Processing
+description: Run every due job in one synchronous pass with ProcessReady — for cron containers, serverless functions, and drain-and-exit commands.
+---
+
+# One-Shot Processing
+
+A long-lived worker process is the right shape for most applications, but not for all of them. Sometimes something else already owns the cadence: a Kubernetes `CronJob` that fires every minute, a Lambda woken by an EventBridge rule, an ECS scheduled task.
+
+Those platforms want to *call a function and get an exit code*, not supervise a pool of goroutines that outlive the invocation. And sometimes you just want a command that empties the queue and stops — for a smoke test, a data migration, or the last step of a deploy script.
+
+`ProcessReady` is that shape:
+
+```go
+results, err := client.ProcessReady(ctx, "critical", "default")
+```
+
+One synchronous pass, on your goroutine. It returns when there is nothing left to run.
+
+## What a pass does
+
+::::steps
+
+##### Promote everything due
+
+The pass starts by doing the mover's job: every scheduled job whose time has come, and every retryable job whose backoff has elapsed, becomes available. A job you enqueued with a two-hour delay two hours ago will run in this pass, even though no background loop has been alive in between.
+
+##### Work each queue, in the order you named it
+
+`ProcessReady(ctx, "critical", "default")` drains `critical` completely, then drains `default`. The argument order is a priority order, not a set — a busy `critical` queue is emptied before `default` is touched at all. There is no weighting here and no round-robin, because there is no contention: nothing is running in parallel.
+
+##### Return one result per execution
+
+```go
+for _, r := range results {
+	slog.Info("job", "kind", r.Job.Kind, "id", r.Job.ID, "outcome", r.Outcome, "err", r.Err)
+}
+```
+
+::::
+
+Each `goque.JobResult` carries the `JobRow` as it was handed to the worker — so `r.Job.Attempt` is the attempt that just ran — plus an `Outcome` and, for failures, the error's message:
+
+| Outcome | Meaning |
+| --- | --- |
+| `goque.OutcomeCompleted` | The worker returned `nil`. Done. |
+| `goque.OutcomeRetried` | The attempt failed and the job was rescheduled for another one. |
+| `goque.OutcomeCancelled` | The worker returned `goque.Cancel(err)`. It will never run again. |
+| `goque.OutcomeDead` | The attempt failed and it was the job's last. Retained with its error history. |
+| `goque.OutcomeSnoozed` | The worker returned `goque.SnoozeFor(d)`. Rescheduled, no attempt consumed. |
+
+Which makes an invocation summary a fold over the slice:
+
+```go
+results, err := client.ProcessReady(ctx, "default")
+
+var completed, retried, dead int
+for _, r := range results {
+	switch r.Outcome {
+	case goque.OutcomeCompleted:
+		completed++
+	case goque.OutcomeRetried:
+		retried++
+	case goque.OutcomeDead:
+		dead++
+	}
+}
+
+slog.Info("pass finished",
+	"ran", len(results), "completed", completed, "retried", retried, "dead", dead)
+if err != nil {
+	return err
+}
+```
+
+Note the ordering: check the results *and* the error. A pass can do useful work and still return an error, which is the next section.
+
+## What it does not do
+
+`ProcessReady` is not "`Start` for one second". It launches **nothing**:
+
+- **No background goroutines.** Every job runs on the goroutine that called it, one at a time. When it returns, nothing is in flight.
+- **No polling.** It works what is available, then stops. It never waits for more.
+- **No heartbeat loop, no rescuer, no cleaner.** The maintenance loops belong to `Start`. Retention cleanup, in particular, does not happen during a one-shot pass.
+
+:::warning[Use it on a client you have not started]
+A started client's dispatcher is already claiming from these same queues. Calling `ProcessReady` on it means two things racing for the same jobs — each will get some of them, but neither is doing what you intended, and nothing that reads the results will make sense.
+
+Pick one. A long-lived process uses `Start`; a scheduled invocation builds a client, calls `ProcessReady`, and exits.
+:::
+
+That also explains the heartbeat consequence. A job claimed during a pass gets a heartbeat at claim time and nothing renews it, so a pass that runs longer than `RescueTTL` next to a *started* client would look abandoned to that client's rescuer.
+
+On a client you have not started, there is no rescuer, and the point is moot — which is the whole reason for the rule above.
+
+## Cron containers and scheduled tasks
+
+The canonical deployment: a container that runs to completion every minute.
+
+```go [cmd/drain/main.go]
+package main
+
+import (
+	"context"
+	"log/slog"
+	"os"
+	"time"
+
+	"github.com/swissy-dev/goque"
+	"github.com/swissy-dev/goque/backend/memory"
+)
+
+func main() {
+	client, err := goque.NewClient(memory.New(), &goque.Config{
+		Workers: registerWorkers(),
+		Logger:  slog.Default(),
+	})
+	if err != nil {
+		slog.Error("client", "err", err)
+		os.Exit(1)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+
+	results, err := client.ProcessReady(ctx, "critical", "default", "bulk")
+	slog.Info("drained", "jobs", len(results))
+	if err != nil {
+		slog.Error("pass ended early", "err", err)
+		os.Exit(1)
+	}
+}
+```
+
+Two details are easy to miss. The client has **no `Queues` configured** — it never dispatches on its own, so it does not need them; the queues to work are the arguments to `ProcessReady`. And it does need `Workers`, because something has to run the jobs:
+
+```go
+results, err := client.ProcessReady(ctx, "default")
+// error: goque: ProcessReady requires workers
+```
+
+Give the pass a timeout comfortably under your scheduler's own, as above. A five-minute cron with a four-minute pass timeout will not overlap itself.
+
+## Serverless invocations
+
+In a function-as-a-service environment your invocation has a hard budget, and being killed halfway through is worse than stopping early.
+
+`ProcessReady` checks for cancellation between jobs and returns **the results collected so far alongside the context's error** — so a deadline stops the pass cleanly instead of throwing away the record of what already ran.
+
+```go
+func Handle(ctx context.Context) error {
+	// Leave a margin: finish before the platform's own deadline, not at it.
+	passCtx, cancel := context.WithTimeout(ctx, 20*time.Second)
+	defer cancel()
+
+	results, err := client.ProcessReady(passCtx, "default")
+	slog.Info("invocation", "ran", len(results))
+
+	if errors.Is(err, context.DeadlineExceeded) {
+		// Not a failure: we ran out of time, the rest is still queued
+		// and the next invocation picks it up.
+		return nil
+	}
+	return err
+}
+```
+
+Jobs already completed within the pass are already finalized in the backend — cancellation costs you the *remaining backlog*, not the work you did. Whatever is left stays queued for the next invocation.
+
+The same shape catches the runaway case: a pass gives up on a queue that yields more than ten thousand executions, returning an error rather than looping forever. That means a job is enqueueing itself.
+
+## What carries over to the next pass
+
+A pass is a snapshot of "what is due right now", and two rules follow from that.
+
+**A job that retries within the pass is not re-run by that pass.** Its retry is scheduled for the future, and the promotion step already happened, so it stays retryable until a later call promotes it:
+
+```go
+// Pass 1: the job fails and is scheduled to retry in 30 seconds.
+first, _ := client.ProcessReady(ctx, "default")   // one result, OutcomeRetried
+
+// Pass 2, immediately after: nothing is due.
+second, _ := client.ProcessReady(ctx, "default")  // empty
+
+// A minute later, the backoff has elapsed.
+third, _ := client.ProcessReady(ctx, "default")   // one result, the retry
+```
+
+The same is true of `SnoozeFor` — a snoozed job comes back when it comes due, not before. This is exactly the behaviour you want from a cron container: it does not spin on a failing job, and your backoff curve is still honoured across invocations rather than collapsed into one.
+
+**A job enqueued *during* the pass may still be picked up by it** — if it is due immediately and it lands in a queue the pass has not drained yet. A `critical` job enqueued while `critical` is still being drained will run; one enqueued after the pass has moved on to `bulk` waits for next time.
+
+Do not design around it in either direction. If a follow-up job must run in the same pass, put it in a queue you name later in the list.
+
+## The same engine your tests drive
+
+`ProcessReady` is what `client.Fake(t)` calls underneath. `f.RunReady(ctx)` moves the fake clock's idea of "now" and then makes exactly this pass.
+
+That is a nice property to know about: the synchronous path your tests exercise is not a simplified stand-in for the dispatcher, it is a supported production API in its own right.
+
+Middleware runs, retry policies apply, error and panic handlers fire, outcomes are recorded identically. A cron container and a test are running the same code with different clocks.
+
+[Testing Jobs](/testing) covers the clock, the assertions, and `RunUntilIdle` for draining cascades without advancing time.
+
+## Next steps
+
+- **[Testing Jobs](/testing)** — the fake clock built on this engine.
+- **[Starting & Stopping](/running/lifecycle)** — the long-lived alternative, and when to prefer it.
+- **[Retries & Backoff](/configuration/retries)** — why a retried job waits for a later pass.
+- **[Queues & Concurrency](/running/queues)** — how the same queues behave under a started client.
