@@ -338,12 +338,36 @@ type CleanParams struct {
 // be safe for concurrent use, both from many goroutines in one process and from
 // many processes sharing one store; the conformance suite in
 // [github.com/swissy-dev/goque/backendtest] checks the guarantees described below.
+//
+// Every instant a caller supplies directly — [Backend.Enqueue]'s ScheduledAt,
+// [Backend.Retry]'s and [Backend.Snooze]'s At — must fall within [MinInstant]
+// and [MaxInstant]; a backend rejects one that does not, and a batch
+// containing one, with an error wrapping [ErrTimeOutOfRange], changing
+// nothing. A PriorityAt derived from a stored PriorityBoost rather than
+// supplied directly — [Backend.Retry]'s, [Backend.Snooze]'s, and
+// [Backend.RescueStale]'s — clamps to MinInstant or MaxInstant instead of
+// failing, because the boost was recorded long before the call and refusing
+// to finalize or rescue a job over it would strand it.
+//
+// Every method must return once its ctx is done, even against an unreachable
+// store. A goque Client's completer bounds each call with a per-attempt
+// timeout, its Stop drains outstanding work within a caller-supplied
+// deadline, and the goroutine performing that drain stays alive until the
+// call returns — a Backend that ignores cancellation parks it indefinitely.
 type Backend interface {
 	// Enqueue stores jobs. For each row it assigns ID, sets CreatedAt to Now,
 	// defaults an unset ScheduledAt to Now, sets State to available or
 	// scheduled depending on whether ScheduledAt has arrived, and derives
 	// PriorityAt from ScheduledAt and PriorityBoost. The passed rows are
 	// updated in place so the caller can read the assigned IDs back.
+	//
+	// Enqueue is the one place where a derived instant is rejected rather
+	// than clamped: if any row's ScheduledAt falls outside the storable range,
+	// or its ScheduledAt minus its PriorityBoost underflows MinInstant, the
+	// whole batch fails with ErrTimeOutOfRange and nothing is stored. Both
+	// values come from the caller in the same call, so an impossible request
+	// is the caller's error to fix. The clamping rule above applies only to
+	// instants derived from a boost already on the stored row.
 	Enqueue(ctx context.Context, params EnqueueParams) error
 
 	// Fetch atomically claims up to Limit due jobs from one queue, so a job is
@@ -362,9 +386,11 @@ type Backend interface {
 	Complete(ctx context.Context, params CompleteParams) error
 
 	// Retry fails executions and reschedules them: State becomes retryable,
-	// ScheduledAt and PriorityAt move to At, FinalizedAt is cleared, and Err is
-	// appended to the error history. The attempt already spent by the claim is
-	// not refunded. It is fenced like [Backend.Complete].
+	// ScheduledAt moves to At, PriorityAt is re-derived as At minus the job's
+	// stored PriorityBoost (clamped, per the range rule above, not rejected —
+	// the boost is stored state, not a supplied instant), FinalizedAt is
+	// cleared, and Err is appended to the error history. The attempt already
+	// spent by the claim is not refunded. It is fenced like [Backend.Complete].
 	Retry(ctx context.Context, params RetryParams) error
 
 	// Cancel stops executions permanently: State becomes cancelled, FinalizedAt
@@ -380,10 +406,11 @@ type Backend interface {
 	Kill(ctx context.Context, params KillParams) error
 
 	// Snooze reschedules executions without failing them: State becomes
-	// retryable and ScheduledAt moves to At, but the attempt spent by the claim
-	// is given back and no error is recorded, so snoozing never moves a job
-	// closer to dead. Generation is untouched, so the token still only ever
-	// rises. It is fenced like [Backend.Complete].
+	// retryable, ScheduledAt moves to At, and PriorityAt is re-derived as At
+	// minus the job's stored PriorityBoost, clamped like [Backend.Retry]'s. The
+	// attempt spent by the claim is given back and no error is recorded, so
+	// snoozing never moves a job closer to dead. Generation is untouched, so
+	// the token still only ever rises. It is fenced like [Backend.Complete].
 	Snooze(ctx context.Context, params SnoozeParams) error
 
 	// Heartbeat renews the lease on running executions, setting HeartbeatAt to
@@ -402,11 +429,12 @@ type Backend interface {
 	MoveDue(ctx context.Context, params MoveDueParams) (int, error)
 
 	// RescueStale returns running jobs whose HeartbeatAt is older than TTL to
-	// the retryable state with ScheduledAt set to Now, up to Limit, and returns
-	// how many it rescued. The attempt is not consumed again, and because the
-	// row stops being running the abandoned execution's own finalization is
-	// fenced out if it ever arrives. It must be idempotent and
-	// concurrency-safe.
+	// the retryable state with ScheduledAt set to Now and PriorityAt re-derived
+	// as Now minus the job's stored PriorityBoost, clamped like
+	// [Backend.Retry]'s, up to Limit, and returns how many it rescued. The
+	// attempt is not consumed again, and because the row stops being running
+	// the abandoned execution's own finalization is fenced out if it ever
+	// arrives. It must be idempotent and concurrency-safe.
 	RescueStale(ctx context.Context, params RescueParams) (int, error)
 
 	// Clean deletes terminal jobs whose FinalizedAt is older than the retention

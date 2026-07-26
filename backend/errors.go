@@ -44,6 +44,10 @@ var (
 	// the only shape a job row can carry. Enqueuing returns an error wrapping
 	// it.
 	ErrInvalidMetadata = errors.New("goque: metadata must be a JSON object")
+	// ErrTimeOutOfRange reports an instant a backend cannot store. Backends
+	// order jobs by an int64 nanosecond count, so every instant they are given
+	// must fall between MinInstant and MaxInstant inclusive.
+	ErrTimeOutOfRange = errors.New("goque: time outside the representable range")
 )
 
 // StaleError reports the jobs in a batch that a fenced operation could not

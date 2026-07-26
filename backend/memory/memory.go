@@ -46,11 +46,25 @@ func copyRow(r *backend.JobRow) *backend.JobRow {
 
 // Enqueue implements [backend.Backend]. It assigns each row an ID and stores a
 // copy, filling in CreatedAt, State, and PriorityAt on the caller's rows as
-// well. It never fails.
+// well. If any row's ScheduledAt, or its ScheduledAt minus its PriorityBoost,
+// falls outside the storable range, it rejects the whole batch with an error
+// wrapping [backend.ErrTimeOutOfRange] and stores nothing.
 func (b *Backend) Enqueue(_ context.Context, params backend.EnqueueParams) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	for _, j := range params.Jobs {
+	prio := make([]time.Time, len(params.Jobs))
+	for i, j := range params.Jobs {
+		at := j.ScheduledAt
+		if at.IsZero() {
+			at = params.Now
+		}
+		p, err := backend.SubDuration(at, j.PriorityBoost)
+		if err != nil {
+			return err
+		}
+		prio[i] = p
+	}
+	for i, j := range params.Jobs {
 		b.nextID++
 		j.ID = b.nextID
 		j.CreatedAt = params.Now
@@ -62,7 +76,7 @@ func (b *Backend) Enqueue(_ context.Context, params backend.EnqueueParams) error
 		} else {
 			j.State = backend.StateAvailable
 		}
-		j.PriorityAt = j.ScheduledAt.Add(-j.PriorityBoost)
+		j.PriorityAt = prio[i]
 		b.jobs[j.ID] = copyRow(j)
 	}
 	return nil
@@ -142,18 +156,24 @@ func (b *Backend) Complete(_ context.Context, params backend.CompleteParams) err
 }
 
 // Retry implements [backend.Backend], returning a [backend.StaleError] that
-// names any job whose ID, generation, and running state did not match.
+// names any job whose ID, generation, and running state did not match. If any
+// entry's At falls outside the representable range, it returns an error
+// wrapping [backend.ErrTimeOutOfRange] and leaves every job in the batch
+// untouched.
 func (b *Backend) Retry(_ context.Context, params backend.RetryParams) error {
 	ids := make([]int64, len(params.Jobs))
 	gens := make([]int, len(params.Jobs))
 	for i, f := range params.Jobs {
+		if err := backend.ValidateInstant(f.At); err != nil {
+			return err
+		}
 		ids[i], gens[i] = f.ID, f.Generation
 	}
 	return b.finalize(ids, gens, params.Now, func(j *backend.JobRow, i int) {
 		f := params.Jobs[i]
 		j.State = backend.StateRetryable
 		j.ScheduledAt = f.At
-		j.PriorityAt = f.At.Add(-j.PriorityBoost)
+		j.PriorityAt = backend.SubDurationClamped(f.At, j.PriorityBoost)
 		j.FinalizedAt = time.Time{}
 		j.Errors = append(j.Errors, f.Err)
 		mergeMeta(j, f.Metadata)
@@ -196,11 +216,16 @@ func (b *Backend) Kill(_ context.Context, params backend.KillParams) error {
 
 // Snooze implements [backend.Backend], giving back the attempt the claim spent
 // and returning a [backend.StaleError] that names any job whose ID,
-// generation, and running state did not match.
+// generation, and running state did not match. If any entry's At falls
+// outside the representable range, it returns an error wrapping
+// [backend.ErrTimeOutOfRange] and leaves every job in the batch untouched.
 func (b *Backend) Snooze(_ context.Context, params backend.SnoozeParams) error {
 	ids := make([]int64, len(params.Jobs))
 	gens := make([]int, len(params.Jobs))
 	for i, f := range params.Jobs {
+		if err := backend.ValidateInstant(f.At); err != nil {
+			return err
+		}
 		ids[i], gens[i] = f.ID, f.Generation
 	}
 	return b.finalize(ids, gens, params.Now, func(j *backend.JobRow, i int) {
@@ -208,7 +233,7 @@ func (b *Backend) Snooze(_ context.Context, params backend.SnoozeParams) error {
 		j.State = backend.StateRetryable
 		j.Attempt--
 		j.ScheduledAt = f.At
-		j.PriorityAt = f.At.Add(-j.PriorityBoost)
+		j.PriorityAt = backend.SubDurationClamped(f.At, j.PriorityBoost)
 		j.FinalizedAt = time.Time{}
 		mergeMeta(j, f.Metadata)
 	})
@@ -265,7 +290,7 @@ func (b *Backend) RescueStale(_ context.Context, params backend.RescueParams) (i
 		if j.State == backend.StateRunning && j.HeartbeatAt.Before(cutoff) {
 			j.State = backend.StateRetryable
 			j.ScheduledAt = params.Now
-			j.PriorityAt = params.Now.Add(-j.PriorityBoost)
+			j.PriorityAt = backend.SubDurationClamped(params.Now, j.PriorityBoost)
 			n++
 		}
 	}

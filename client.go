@@ -93,7 +93,12 @@ type Config struct {
 	// policy or becomes dead if its attempts are used up.
 	PanicHandler func(ctx context.Context, row *JobRow, recovered any, stack []byte)
 	// Logger receives the client's operational logging. Defaults to
-	// [slog.Default].
+	// [slog.Default]. A stall long enough to keep the completer's buffer
+	// saturated for a full push timeout — not merely a slow backend, but one
+	// making no progress — drops a job's outcome instead of delivering it;
+	// that job is then rescued and re-run like any stale execution, so this
+	// is a source of at-least-once execution during normal running, not only
+	// during [Client.Stop].
 	Logger *slog.Logger
 	// Now, if set, replaces [time.Now] as the client's clock for job timestamps
 	// and scheduling decisions. It does not drive wall-clock machinery such as

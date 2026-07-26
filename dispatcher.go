@@ -19,6 +19,8 @@ type queueState struct {
 	credit  int
 }
 
+var completerFlushSize = 128
+
 // Start begins working jobs. It launches the fetchers that claim work from the
 // configured queues, the completer that batches finalizations back to the
 // backend, the heartbeat loop, and the three maintenance loops: the mover that
@@ -60,7 +62,7 @@ func (c *Client) Start(ctx context.Context) error {
 	liveCtx, liveCancel := context.WithCancel(context.Background())
 	c.fetchCancel = fetchCancel
 	c.liveCancel = liveCancel
-	c.completer = newCompleter(c.backend, c.now, 128, 50*time.Millisecond, c.cfg.Logger)
+	c.completer = newCompleter(c.backend, c.now, completerFlushSize, 50*time.Millisecond, c.cfg.Logger)
 	c.completer.start()
 	var queues []*queueState
 	for name, qc := range c.cfg.Queues {
@@ -267,7 +269,14 @@ func (c *Client) maintenanceLoop(ctx context.Context, name string, every time.Du
 // gives them a brief grace period, and then returns ctx's error while a
 // background goroutine finishes the drain. Losing patience therefore interrupts
 // jobs rather than abandoning them, but the client may still be settling when
-// Stop returns.
+// Stop returns. Jobs already running are given as long as they need to finish
+// on their own; once each one returns, though, handing off its outcome is
+// bounded even if the backend cannot make progress — provided every
+// [backend.Backend] method returns once its context is done, which is part of
+// that interface's contract. A backend that ignores cancellation can still
+// park the drain goroutine indefinitely, even though Stop itself has already
+// returned. [Client.Start] and [Client.Fake] are refused only while that
+// settling is still under way.
 func (c *Client) Stop(ctx context.Context) error {
 	c.mu.Lock()
 	if !c.started {
@@ -288,7 +297,9 @@ func (c *Client) Stop(ctx context.Context) error {
 		c.jobWg.Wait()
 		liveCancel()
 		c.liveWg.Wait()
-		c.completer.stop()
+		drainCtx, cancelDrain := context.WithTimeout(context.WithoutCancel(ctx), completerDrainTimeout)
+		c.completer.stop(drainCtx)
+		cancelDrain()
 		c.mu.Lock()
 		c.stopping = false
 		c.mu.Unlock()

@@ -85,7 +85,7 @@ func TestRunJobOutcomes(t *testing.T) {
 		PanicHandler: func(ctx context.Context, row *JobRow, recovered any, stack []byte) { panicSeen++ },
 	}
 	c, b, cp := execHarness(t, cfg)
-	defer cp.stop()
+	defer cp.stop(context.Background())
 
 	if s := runOne(t, c, b, cp, "ok"); s.State != backend.StateCompleted {
 		t.Fatalf("ok → %s", s.State)
@@ -153,7 +153,7 @@ func TestPanicThroughRecoveryMiddlewarePreservesReporting(t *testing.T) {
 		},
 	}
 	c, b, cp := execHarness(t, cfg)
-	defer cp.stop()
+	defer cp.stop(context.Background())
 
 	s := runOne(t, c, b, cp, "panic")
 
@@ -205,7 +205,7 @@ func TestStaleAttemptDoesNotEvictNewerActiveEntry(t *testing.T) {
 	}
 	cp := newCompleter(b, c.now, 1, time.Millisecond, c.cfg.Logger)
 	cp.start()
-	defer cp.stop()
+	defer cp.stop(context.Background())
 
 	res, err := c.Enqueue(context.Background(), staleArgs{})
 	if err != nil {
@@ -273,7 +273,7 @@ func TestRetryAtRespectsMaxAttempts(t *testing.T) {
 		ErrorHandler: func(ctx context.Context, row *JobRow, err error) { errSeen++ },
 	}
 	c, b, cp := execHarness(t, cfg)
-	defer cp.stop()
+	defer cp.stop(context.Background())
 
 	if s := runOne(t, c, b, cp, "retryat", WithMaxAttempts(1)); s.State != backend.StateDead {
 		t.Fatalf("retryat exhausted → %s, want dead", s.State)
@@ -291,7 +291,7 @@ func TestRetryAtRespectsMaxAttempts(t *testing.T) {
 
 func TestRunJobTimeout(t *testing.T) {
 	c, b, cp := execHarness(t, Config{})
-	defer cp.stop()
+	defer cp.stop(context.Background())
 	s := runOne(t, c, b, cp, "slow", WithTimeout(20*time.Millisecond))
 	if s.State != backend.StateRetryable {
 		t.Fatalf("timeout → %s", s.State)
@@ -300,7 +300,7 @@ func TestRunJobTimeout(t *testing.T) {
 
 func TestRunJobUnknownKind(t *testing.T) {
 	c, b, cp := execHarness(t, Config{})
-	defer cp.stop()
+	defer cp.stop(context.Background())
 	row := &backend.JobRow{Kind: "ghost.kind", Queue: "default", Payload: []byte(`{}`), MaxAttempts: 3, ScheduledAt: c.now()}
 	if err := b.Enqueue(context.Background(), backend.EnqueueParams{Jobs: []*backend.JobRow{row}, Now: c.now()}); err != nil {
 		t.Fatal(err)
