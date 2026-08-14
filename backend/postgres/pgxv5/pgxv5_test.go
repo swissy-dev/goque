@@ -161,6 +161,44 @@ func TestInTxRejectsForeignTransaction(t *testing.T) {
 	}
 }
 
+func TestSQLStateReportsThePostgresCode(t *testing.T) {
+	ctx := context.Background()
+	d := newDriver(t)
+	schema := postgrestest.Schema(ctx, t, d)
+
+	_, err := d.Exec(ctx, `SELECT * FROM "`+schema+`".table_that_does_not_exist`)
+	if err == nil {
+		t.Fatal("querying a missing table must fail")
+	}
+	if got := d.SQLState(err); got != "42P01" {
+		t.Fatalf("SQLState = %q, want 42P01 for an undefined table", got)
+	}
+
+	if _, err := d.Exec(ctx, `CREATE TABLE "`+schema+`".u (id int PRIMARY KEY)`); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := d.Exec(ctx, `INSERT INTO "`+schema+`".u (id) VALUES (1)`); err != nil {
+		t.Fatal(err)
+	}
+	_, err = d.Exec(ctx, `INSERT INTO "`+schema+`".u (id) VALUES (1)`)
+	if err == nil {
+		t.Fatal("a duplicate primary key must fail")
+	}
+	if got := d.SQLState(err); got != "23505" {
+		t.Fatalf("SQLState = %q, want 23505 for a unique violation", got)
+	}
+}
+
+func TestSQLStateIsEmptyForANonDatabaseError(t *testing.T) {
+	d := newDriver(t)
+	if got := d.SQLState(errors.New("not from the database")); got != "" {
+		t.Fatalf("SQLState = %q, want an empty string for a non-database error", got)
+	}
+	if got := d.SQLState(nil); got != "" {
+		t.Fatalf("SQLState(nil) = %q, want an empty string", got)
+	}
+}
+
 func countRows(ctx context.Context, t *testing.T, d postgres.Driver, schema string) int {
 	t.Helper()
 	rows, err := d.Query(ctx, `SELECT count(*) FROM "`+schema+`".t`)

@@ -9,6 +9,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/swissy-dev/goque/backend/postgres"
 )
 
@@ -120,6 +121,9 @@ func migrationsFullyApplied(fsys fs.FS, applied sql.NullInt64) (bool, error) {
 }
 
 func isUndefinedTable(err error) bool {
-	return strings.Contains(err.Error(), "42P01") ||
-		strings.Contains(strings.ToLower(err.Error()), "does not exist")
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code == "42P01"
+	}
+	return false
 }

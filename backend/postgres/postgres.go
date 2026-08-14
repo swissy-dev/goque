@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"regexp"
 	"strings"
+
+	"github.com/swissy-dev/goque/backend"
 )
 
 // ErrInvalidSchema reports a schema name that is not a plain SQL identifier.
@@ -63,8 +65,11 @@ type Backend struct {
 	cfg config
 }
 
-// New builds a Backend over d. Pass pgxv5.New for the default path, or
-// databasesql.New for the compatibility path, which polls rather than listens.
+var _ backend.Backend = (*Backend)(nil)
+
+// New builds a Backend over d. Pass pgxv5.New for the default path. A
+// database/sql-based driver for a compatibility path that polls rather than
+// listens is planned but does not exist yet.
 func New(d Driver, opts ...Option) (*Backend, error) {
 	if d == nil {
 		return nil, errors.New("goque/postgres: nil driver")

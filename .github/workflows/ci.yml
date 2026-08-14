@@ -60,7 +60,7 @@ jobs:
           fi
       - name: Release reminder — new modules must drop their replace directives
         run: |
-          if grep -q '^replace' backend/postgres/go.mod backend/postgres/pgxv5/go.mod backend/postgres/goosemigrate/go.mod; then
+          if grep -q '^replace' backend/postgres/go.mod backend/postgres/pgxv5/go.mod backend/postgres/goosemigrate/go.mod backend/postgres/conformance/go.mod; then
             echo "::warning::replace directives must be removed before publishing"
           fi
           exit 0
@@ -96,5 +96,17 @@ jobs:
           fi
           if grep -q -- '--- SKIP' /tmp/goose.log; then
             echo "goosemigrate tests were skipped; CI must not pass by skipping"; exit 1
+          fi
+        shell: bash
+      - name: Conformance module
+        run: |
+          cd backend/postgres/conformance
+          go vet ./...
+          go test ./... -race -v 2>&1 | tee /tmp/conformance.log
+          if grep -q -- '--- FAIL' /tmp/conformance.log; then
+            echo "a conformance test failed"; exit 1
+          fi
+          if grep -q -- '--- SKIP' /tmp/conformance.log; then
+            echo "conformance tests were skipped; CI must not pass by skipping"; exit 1
           fi
         shell: bash

@@ -1,9 +1,15 @@
 package goosemigrate
 
 import (
+	"context"
 	"database/sql"
 	"testing"
 	"testing/fstest"
+
+	"github.com/jackc/pgx/v5/pgxpool"
+	"github.com/jackc/pgx/v5/stdlib"
+	"github.com/swissy-dev/goque/backend/postgres/pgxv5"
+	"github.com/swissy-dev/goque/backend/postgres/postgrestest"
 )
 
 func syntheticMigrationsWithATrailingNonIndexVersion() fstest.MapFS {
@@ -60,5 +66,29 @@ func TestMigrationsFullyAppliedFalseWhenNothingIsRecordedApplied(t *testing.T) {
 	}
 	if upToDate {
 		t.Fatal("migrationsFullyApplied reported up to date against a database with nothing recorded applied")
+	}
+}
+
+func TestVersionSkewDoesNotSwallowAMissingColumn(t *testing.T) {
+	ctx := context.Background()
+	pool, err := pgxpool.New(ctx, postgrestest.DSN(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(pool.Close)
+	db := stdlib.OpenDBFromPool(pool)
+	t.Cleanup(func() { _ = db.Close() })
+	d := pgxv5.New(pool)
+	schema := postgrestest.Schema(ctx, t, d)
+
+	if err := Up(ctx, db, WithSchema(schema)); err != nil {
+		t.Fatal(err)
+	}
+	_, err = db.QueryContext(ctx, `SELECT column_that_does_not_exist FROM "`+schema+`".goque_migration`)
+	if err == nil {
+		t.Fatal("selecting a missing column must fail")
+	}
+	if isUndefinedTable(err) {
+		t.Fatal("a missing column must not be mistaken for a missing table; version skew would be silently skipped")
 	}
 }

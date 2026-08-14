@@ -13,6 +13,7 @@ import (
 	"fmt"
 
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 	"github.com/swissy-dev/goque/backend"
 	"github.com/swissy-dev/goque/backend/postgres"
@@ -94,6 +95,14 @@ func (d *driver) InTx(_ context.Context, v any) (postgres.Driver, error) {
 		return nil, fmt.Errorf("%w: pgxv5 needs a pgx.Tx, got %T", backend.ErrInvalidTx, v)
 	}
 	return &driver{pool: d.pool, tx: t}, nil
+}
+
+func (d *driver) SQLState(err error) string {
+	var pgErr *pgconn.PgError
+	if errors.As(err, &pgErr) {
+		return pgErr.Code
+	}
+	return ""
 }
 
 type tx struct {

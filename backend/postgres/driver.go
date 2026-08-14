@@ -44,6 +44,15 @@ type Driver interface {
 	// that created the reason for it. It returns backend.ErrInvalidTx when tx
 	// is not a type this driver understands.
 	InTx(ctx context.Context, tx any) (Driver, error)
+	// SQLState returns the five-character SQLSTATE code a database error
+	// carries, or an empty string when err is nil or did not come from the
+	// server. It is reserved: no shipped code in this package calls it yet.
+	// It stays on Driver anyway because adding a method to this interface
+	// later would break every third-party implementation, and this is the
+	// seam a caller would need to recognise conditions like a unique
+	// violation or a serialization failure without matching on message text,
+	// which varies by server version and locale.
+	SQLState(err error) string
 }
 
 // Tx is a Driver scoped to one transaction.
