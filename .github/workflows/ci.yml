@@ -1,0 +1,100 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  core:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: Core module has no third-party dependencies
+        run: |
+          if grep -q '^require' go.mod; then
+            echo "the core module must stay dependency-free"; exit 1
+          fi
+      - name: testing is not in the library dependency graph
+        run: |
+          deps=$(go list -deps .)
+          if grep -qx testing <<<"$deps"; then
+            echo "testing leaked into the library's dependency graph"; exit 1
+          fi
+        shell: bash
+      - name: gofmt
+        run: |
+          gofmt -l . > /tmp/fmt.txt
+          if [ -s /tmp/fmt.txt ]; then cat /tmp/fmt.txt; exit 1; fi
+        shell: bash
+      - run: go vet ./...
+      - run: go test ./... -race
+
+  postgres:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17
+        env:
+          POSTGRES_PASSWORD: goque
+        ports: ['5432:5432']
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    env:
+      GOQUE_TEST_POSTGRES: postgres://postgres:goque@localhost:5432/postgres?sslmode=disable
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-go@v5
+        with:
+          go-version: '1.25'
+      - name: postgres module is driver-free
+        run: |
+          if grep -q pgx backend/postgres/go.mod; then
+            echo "pgx leaked into the postgres module"; exit 1
+          fi
+      - name: Release reminder — new modules must drop their replace directives
+        run: |
+          if grep -q '^replace' backend/postgres/go.mod backend/postgres/pgxv5/go.mod backend/postgres/goosemigrate/go.mod; then
+            echo "::warning::replace directives must be removed before publishing"
+          fi
+          exit 0
+        shell: bash
+      - name: Unit tests
+        run: cd backend/postgres && go vet ./... && go test ./... -race
+        shell: bash
+      - name: Integration tests
+        run: |
+          cd backend/postgres/pgxv5
+          go vet ./...
+          go test ./... -race -v 2>&1 | tee /tmp/pg.log
+          if grep -q -- '--- FAIL' /tmp/pg.log; then
+            echo "a PostgreSQL integration test failed"; exit 1
+          fi
+          if grep -q -- '--- SKIP' /tmp/pg.log; then
+            echo "PostgreSQL tests were skipped; CI must not pass by skipping"; exit 1
+          fi
+        shell: bash
+      - name: postgres module is runner-free
+        run: |
+          if grep -q goose backend/postgres/go.mod; then
+            echo "goose leaked into the postgres module"; exit 1
+          fi
+        shell: bash
+      - name: goosemigrate tests
+        run: |
+          cd backend/postgres/goosemigrate
+          go vet ./...
+          go test ./... -race -v 2>&1 | tee /tmp/goose.log
+          if grep -q -- '--- FAIL' /tmp/goose.log; then
+            echo "a goosemigrate test failed"; exit 1
+          fi
+          if grep -q -- '--- SKIP' /tmp/goose.log; then
+            echo "goosemigrate tests were skipped; CI must not pass by skipping"; exit 1
+          fi
+        shell: bash
