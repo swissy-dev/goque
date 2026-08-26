@@ -85,3 +85,4 @@ func (stubDriver) Exec(context.Context, string, ...any) (int64, error) { return 
 func (stubDriver) Begin(context.Context) (Tx, error)                   { return nil, nil }
 func (stubDriver) Conn(context.Context) (Conn, error)                  { return nil, nil }
 func (stubDriver) InTx(context.Context, any) (Driver, error)           { return nil, nil }
+func (stubDriver) SQLState(error) string                               { return "" }

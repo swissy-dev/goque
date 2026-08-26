@@ -3,6 +3,7 @@ go 1.25.7
 use (
 	.
 	./backend/postgres
+	./backend/postgres/conformance
 	./backend/postgres/goosemigrate
 	./backend/postgres/pgxv5
 )
