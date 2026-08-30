@@ -256,7 +256,8 @@ type EnqueueResult struct {
 	Skipped bool
 }
 
-// InsertParams is one job in a batch passed to [Client.EnqueueMany].
+// InsertParams is one job in a batch passed to [Client.EnqueueMany] or
+// [Client.EnqueueManyTx].
 type InsertParams struct {
 	// Args are the job's arguments, and their Kind selects the worker.
 	Args JobArgs
@@ -278,23 +279,29 @@ func (c *Client) buildRows(params []InsertParams) ([]*JobRow, error) {
 	return rows, nil
 }
 
+func (c *Client) enqueueMany(ctx context.Context, params []InsertParams, enqueue EnqueueFunc) ([]*EnqueueResult, error) {
+	rows, err := c.buildRows(params)
+	if err != nil {
+		return nil, err
+	}
+	if err := enqueue(ctx, rows); err != nil {
+		return nil, err
+	}
+	out := make([]*EnqueueResult, len(rows))
+	for i, row := range rows {
+		out[i] = &EnqueueResult{Job: row}
+	}
+	return out, nil
+}
+
 // EnqueueMany inserts a batch of jobs in a single backend round trip and
 // returns one result per entry, in order. Options are resolved per job, and the
 // whole batch is built before anything is sent, so one job's invalid options
 // fail the call without storing any of them.
 func (c *Client) EnqueueMany(ctx context.Context, params []InsertParams) ([]*EnqueueResult, error) {
-	rows, err := c.buildRows(params)
-	if err != nil {
-		return nil, err
-	}
-	if err := c.enqueueFn()(ctx, rows); err != nil {
-		return nil, err
-	}
-	out := make([]*EnqueueResult, len(rows))
-	for i, r := range rows {
-		out[i] = &EnqueueResult{Job: r}
-	}
-	return out, nil
+	return c.enqueueMany(ctx, params, func(ctx context.Context, jobs []*JobRow) error {
+		return c.enqueueFn()(ctx, jobs)
+	})
 }
 
 // Enqueue inserts a single job. Its kind, and so the worker that will run it,
@@ -306,6 +313,65 @@ func (c *Client) EnqueueMany(ctx context.Context, params []InsertParams) ([]*Enq
 // [backend.ErrInvalidMetadata] if [WithMetadata] is not a JSON object.
 func (c *Client) Enqueue(ctx context.Context, args JobArgs, opts ...EnqueueOption) (*EnqueueResult, error) {
 	res, err := c.EnqueueMany(ctx, []InsertParams{{Args: args, Opts: opts}})
+	if err != nil {
+		return nil, err
+	}
+	return res[0], nil
+}
+
+// EnqueueManyTx inserts a batch of jobs inside a transaction owned by the
+// caller, exactly as [Client.EnqueueMany] does for the ordinary path: options
+// are resolved and validated before anything is sent, middleware runs once
+// around the batch, and results come back in input order with each row's ID
+// assigned in place.
+//
+// tx is opaque to the root package and passed through to the backend
+// unexamined; the backend validates it. With the PostgreSQL backend it must be
+// a pgx v5 pgx.Tx, normally obtained from pool.Begin. The caller alone owns
+// that transaction's lifecycle: EnqueueManyTx never calls Begin, Commit, or
+// Rollback, so the caller must commit or roll back tx itself.
+//
+// EnqueueManyTx returns an error wrapping [backend.ErrNotSupported] if the
+// configured backend does not implement [backend.TxEnqueuer], which the
+// in-memory backend does not, and one wrapping [backend.ErrInvalidTx] if tx is
+// not a handle the backend recognizes. As [Client.EnqueueMany] does for the
+// ordinary path, it also returns an error wrapping
+// [backend.ErrConflictingOptions] if the resolved options combine [WithDelay]
+// with [WithScheduledAt], and one wrapping [backend.ErrInvalidMetadata] if
+// [WithMetadata] is not a JSON object.
+func (c *Client) EnqueueManyTx(ctx context.Context, tx any, params []InsertParams) ([]*EnqueueResult, error) {
+	return c.enqueueManyTx(ctx, tx, params, "EnqueueManyTx")
+}
+
+func (c *Client) enqueueManyTx(ctx context.Context, tx any, params []InsertParams, op string) ([]*EnqueueResult, error) {
+	b, ok := c.backend.(backend.TxEnqueuer)
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", backend.ErrNotSupported, op)
+	}
+	enqueue := chainEnqueue(c.cfg.EnqueueMiddleware, func(ctx context.Context, jobs []*JobRow) error {
+		return b.EnqueueTx(ctx, tx, backend.EnqueueParams{Jobs: jobs, Now: c.now()})
+	})
+	return c.enqueueMany(ctx, params, enqueue)
+}
+
+// EnqueueTx inserts a single job inside a transaction owned by the caller,
+// exactly as [Client.Enqueue] does for the ordinary path.
+//
+// tx is opaque to the root package and passed through to the backend
+// unexamined; the backend validates it. With the PostgreSQL backend it must be
+// a pgx v5 pgx.Tx, normally obtained from pool.Begin. The caller alone owns
+// that transaction's lifecycle: EnqueueTx never calls Begin, Commit, or
+// Rollback, so the caller must commit or roll back tx itself.
+//
+// EnqueueTx returns an error wrapping [backend.ErrNotSupported] if the
+// configured backend does not implement [backend.TxEnqueuer], which the
+// in-memory backend does not, and one wrapping [backend.ErrInvalidTx] if tx is
+// not a handle the backend recognizes. As [Client.Enqueue] does, it also
+// returns an error wrapping [backend.ErrConflictingOptions] if the resolved
+// options combine [WithDelay] with [WithScheduledAt], and one wrapping
+// [backend.ErrInvalidMetadata] if [WithMetadata] is not a JSON object.
+func (c *Client) EnqueueTx(ctx context.Context, tx any, args JobArgs, opts ...EnqueueOption) (*EnqueueResult, error) {
+	res, err := c.enqueueManyTx(ctx, tx, []InsertParams{{Args: args, Opts: opts}}, "EnqueueTx")
 	if err != nil {
 		return nil, err
 	}

@@ -1,10 +1,11 @@
 // Package pgxv5 adapts a pgx v5 pool to goque's PostgreSQL driver seam. It is
-// the default and recommended driver: pgx supports LISTEN, so a client built
-// on it can be woken by a notification rather than a poll tick.
+// the only supported driver for the postgres backend, and the only place in
+// the module tree that depends on pgx: the root goque module stays
+// dependency-free, and every SQL statement stays in the postgres package.
 //
-// It carries no SQL. Every statement goque issues lives in the postgres
-// package, which is what makes this driver and the database/sql one
-// interchangeable.
+// pgx supports LISTEN/NOTIFY, but this driver does not use it yet — the
+// client still discovers new work by polling. Waking on a notification
+// instead of a poll tick is future work.
 package pgxv5
 
 import (

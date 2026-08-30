@@ -82,7 +82,7 @@ Consider a worker charging a credit card. It calls the payment gateway, the char
 
 No queue that survives crashes can avoid this. The side effect (the charge) and the bookkeeping (the job row) are two separate writes to two separate systems, and any process can die between them.
 
-A queue that claims otherwise has either moved the bookkeeping into your database — which is real, and which goque plans to offer through transactional backends — or is not telling you the truth.
+A queue that claims otherwise has either moved the bookkeeping into the same transaction as the side effect, or is not telling you the truth. With the PostgreSQL backend, `goque.JobCompleteTx` is that move — see [Closing the gap with JobCompleteTx](#closing-the-gap-with-jobcompletetx) below. It would not, however, help this specific example: a payment gateway is not inside your database, so there is no shared transaction for the charge and the completion to join. It helps when the job's side effects are writes to your own database.
 
 So: **write idempotent workers.** Give the outbound request an idempotency key. Check whether the invoice already has a PDF before rendering it. Use an upsert.
 
@@ -91,6 +91,33 @@ In practice this is a small amount of work at the top of a worker, and it conver
 :::warning[The window is small, but it is not zero]
 Under the fake and under `ProcessReady`, finalization happens immediately. Under a started client the completer batches finalizations, so the window between a side effect and its record reaching the backend is up to the flush interval. Small enough to ignore in most systems; not small enough to build correctness on.
 :::
+
+### Closing the gap with JobCompleteTx
+
+For side effects that are themselves writes to the PostgreSQL database goque is pointed at, `goque.JobCompleteTx` closes the gap instead of just describing it. Call it from inside `Work`, in the same transaction as the side effect, right before you commit:
+
+```go
+func (w *ChargeWorker) Work(ctx context.Context, job *goque.Job[ChargeCard]) error {
+	tx, err := w.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := recordCharge(ctx, tx, job.Args); err != nil {
+		return err
+	}
+	if err := goque.JobCompleteTx(ctx, tx, job); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
+goque never calls `Begin`, `Commit`, or `Rollback` on `tx` — that transaction is entirely yours. If it commits, the charge and the job's completion become durable atomically; the executor's own ordinary finalization still runs after `Work` returns, but finds the job already completed and drops itself harmlessly. If it rolls back instead, ordinary finalization applies out of band and the job retries — caller misuse does not strand it.
+
+**This is not global exactly-once execution.** A crash between `Work` returning and that commit can still cause `Work` to run again, and nothing about `JobCompleteTx` helps a side effect outside the transaction — an outbound email, an HTTP call, the credit card charge earlier on this page. It narrows the at-least-once gap to zero only for writes made inside the same transaction. Ordinary processing, and any side effect outside that transaction, is still at-least-once. Write idempotent workers regardless.
 
 ## Heartbeats and rescue
 
@@ -178,11 +205,11 @@ Worth stating plainly, because the absence of a promise is easy to miss:
 
 - **Durability is the backend's property, not the library's.** goque never discards a job it acknowledged: non-terminal states are left only through fenced transitions or the rescuer, and the cleaner touches only terminal states. But surviving a power loss depends entirely on where the job is stored, and the in-memory backend stores it in a map — a restart loses everything. See [Backends](/reference/backends).
 - **Timeouts cancel contexts; they do not kill goroutines.** `WithTimeout` cancels the job's context at the deadline, and the executor then waits for `Work` to return. A worker that ignores `ctx.Done()` holds its slot until it finishes or the process dies. Respect your context.
-- **Exactly-once processing is not on offer today.** It requires finalizing the job inside the same transaction as your side effects, which requires a transactional backend. Planned, not built.
+- **Global exactly-once processing is still not on offer.** `JobCompleteTx` finalizes a job inside the same PostgreSQL transaction as side effects that are themselves database writes, which closes the at-least-once gap to zero for those writes specifically — see [Closing the gap with JobCompleteTx](#closing-the-gap-with-jobcompletetx). Nothing narrows the gap for side effects outside that transaction, and processing without it is still at-least-once by default.
 
 ## See also
 
 - **[Backends](/reference/backends)** — the contract that implements all of this, and the conformance suite.
 - **[Retries & Backoff](/configuration/retries)** — attempt budgets and the policies that schedule them.
 - **[Starting & Stopping](/running/lifecycle)** — draining without dropping work.
-- **[Roadmap](/reference/roadmap)** — transactional enqueue, remote cancellation, and the dead-letter browser.
+- **[Roadmap](/reference/roadmap)** — LISTEN/NOTIFY, remote cancellation, and the dead-letter browser.

@@ -23,6 +23,8 @@ If you find a symbol on this site or in the godoc that seems to implement one of
 
 **The in-memory backend.** Complete, concurrency-safe, and conformant — and process-local, so what it is *for* is tests, local development, and single-process applications. See [Backends](/reference/backends).
 
+**The PostgreSQL backend.** Durable and multi-process, with pgx v5 as its only supported driver. `Client.EnqueueTx`/`EnqueueManyTx` enqueue inside a transaction the caller already opened, and `goque.JobCompleteTx` completes the running job inside the worker's own transaction — either way the caller alone owns that transaction's `Begin`, `Commit`, and `Rollback`. LISTEN/NOTIFY wakeups are not implemented yet; the client still discovers new work by polling. See [Backends](/reference/backends#postgresql).
+
 **The conformance suite.** `backendtest.Run` verifies any implementation against the contract in one line of test code, including the concurrency and fencing rules that are easy to get subtly wrong.
 
 **The testing story.** `client.Fake(t)` takes over the clock and drives execution synchronously, so background jobs can be tested without sleeps, goroutines, or flakes — through the real executor, not a mock. `goque.RunWorker` unit-tests a worker with no client at all. This is the part of goque that is furthest ahead. See [Testing Jobs](/testing).
@@ -49,23 +51,19 @@ See [Retries & Backoff](/configuration/retries) and [Error Handling](/configurat
 
 Each of these is specified — semantics, backend requirements, failure modes, and the conformance tests that will verify it. None is implemented.
 
-### Durable backends
+### Non-PostgreSQL durable backends
 
-**Postgres, SQLite, and Redis.** The obvious gap, and the one that changes what goque is for. Today the in-memory backend keeps jobs inside the process that created them; a durable backend is what lets a web tier hand work to a separate worker fleet, and what lets a queue survive a deploy.
+**SQLite and Redis.** PostgreSQL already covers the durable, multi-process case; these fill in deployment shapes it does not — an embedded single-file store for SQLite, and Redis for stacks that already run it.
 
-**Transactional enqueue is the headline, not durability.** Durability you can get from any queue. What a database backend gives you that a separate queue service structurally cannot is the ability to enqueue a job *inside the transaction that created the reason for it*.
+**Why transactional enqueue mattered enough to build first.** Durability alone you can get from any queue. What a database-backed queue gives you that a separate queue service structurally cannot is the ability to enqueue a job *inside the transaction that created the reason for it* — which is what `Client.EnqueueTx` now does against PostgreSQL, and what `goque.JobCompleteTx` does for a worker's own completion.
 
-Consider a signup: you insert the user row and enqueue a welcome email. With the queue in a different system, there are two writes and no way to make them agree.
+Consider a signup: you insert the user row and enqueue a welcome email. With the queue in a different system, there are two writes and no way to make them agree. Commit the user, crash before enqueueing, and the customer never hears from you. Enqueue first, roll the transaction back, and you email a welcome to a user who does not exist and whose ID your worker cannot resolve. Every workaround — outbox tables, reconciliation sweeps, "just retry it" — is a re-implementation of the thing the database already does.
 
-Commit the user, crash before enqueueing, and the customer never hears from you. Enqueue first, roll the transaction back, and you email a welcome to a user who does not exist and whose ID your worker cannot resolve.
+SQLite is a real transactional SQL database too, so it could expose the same transactional-enqueue and transactional-completion capabilities when it is built. Redis cannot: it is not the datastore your business data already lives in, so there is no shared transaction for a job to join.
 
-Every workaround — outbox tables, reconciliation sweeps, "just retry it" — is a re-implementation of the thing the database already does.
+### LISTEN/NOTIFY
 
-When the job row lives in the same database as your business data, the problem stops existing. One transaction, one commit, one outcome. If it rolls back, the job was never created; if it commits, the job is there. This is why the Postgres and SQLite backends matter more than the Redis one, and why they will expose a transactional enqueue path.
-
-A related capability goes further: finalizing a job inside the worker's *own* transaction, so a job's side effects and its completion commit together.
-
-That collapses the at-least-once window to zero for side effects in that database — the only honest route to effectively exactly-once processing, and one that still cannot cover an outbound email or an HTTP call.
+The PostgreSQL client discovers new work by polling. pgx supports `LISTEN`, and waking the dispatcher on a `NOTIFY` instead of a poll tick — cutting the latency of an idle client noticing new work — is designed but not yet built.
 
 ### Enqueue-only clients
 
@@ -166,7 +164,7 @@ It is a design document, not documentation: it describes the system as intended,
 
 ## See also
 
-- **[Backends](/reference/backends)** — the contract the planned backends will implement.
+- **[Backends](/reference/backends)** — the contract every backend implements, including PostgreSQL.
 - **[Lifecycle & Guarantees](/reference/guarantees)** — what is already guaranteed, and what isn't.
 - **[Introduction](/)** — where goque fits today.
 - **[Testing Jobs](/testing)** — the part that is furthest ahead.

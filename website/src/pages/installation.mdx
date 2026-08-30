@@ -32,6 +32,8 @@ The module is organised into a few small packages, and you will usually import o
 | --- | --- |
 | `github.com/swissy-dev/goque` | The client, jobs, workers, options, and the test fake. This is the one you import everywhere. |
 | `github.com/swissy-dev/goque/backend/memory` | The in-memory backend. You construct one and hand it to the client. |
+| `github.com/swissy-dev/goque/backend/postgres` | The PostgreSQL backend. It carries all of the backend's SQL and needs a `Driver` to reach a database. |
+| `github.com/swissy-dev/goque/backend/postgres/pgxv5` | Adapts a pgx v5 pool to that `Driver` seam — the only supported driver, and the only one of these modules that depends on pgx. |
 | `github.com/swissy-dev/goque/middleware` | Optional middleware: logging, metrics hooks, panic recovery. |
 | `github.com/swissy-dev/goque/backend` | The backend contract and job row types. You need this only to write your own backend. |
 | `github.com/swissy-dev/goque/backendtest` | A conformance suite for testing a backend you wrote yourself. |
@@ -47,12 +49,14 @@ import (
 
 ## Choosing a backend
 
-A backend is where jobs live. Today there is one:
+A backend is where jobs live. Two are implemented today.
 
 **`memory`** keeps jobs in the process that created them. Nothing is written to disk, and nothing is shared with other processes. It is complete, fully tested, and genuinely the right choice for tests, for CLI tools, and for single-binary applications that run their own workers.
 
+**`postgres`**, on pgx v5, is durable and multi-process: jobs survive a restart and are visible to every process pointed at the same database, so a web tier can enqueue work that a separate worker fleet claims. It also supports transactional enqueue (`Client.EnqueueTx`/`EnqueueManyTx`) and transactional completion (`goque.JobCompleteTx`), so job state can commit atomically with your own data. pgx v5 is its only supported driver — see [Backends](/reference/backends#postgresql) for construction and migrations.
+
 :::warning
-Because the in-memory backend does not outlive its process or reach across processes, jobs are lost on restart and a separate worker fleet cannot see them. If you need durability or multiple processes, you need one of the database backends on the [Roadmap](/reference/roadmap) — they are specified but not yet built.
+Because the in-memory backend does not outlive its process or reach across processes, jobs are lost on restart and a separate worker fleet cannot see them. If you need durability or multiple processes, use the PostgreSQL backend instead. SQLite and Redis backends remain on the [Roadmap](/reference/roadmap).
 :::
 
 ## Verify it works

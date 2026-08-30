@@ -1,6 +1,6 @@
 ---
 title: Backends
-description: The storage and coordination layer behind the client — the contract, the in-memory implementation, and how to write and verify your own.
+description: The storage and coordination layer behind the client — the contract, the in-memory and PostgreSQL implementations, and how to write and verify your own.
 ---
 
 # Backends
@@ -88,7 +88,7 @@ The limits are equally real, and all three follow from the same fact — the job
 
 **Right choice for:** tests, local development, and a single-process application that can afford to lose queued work on restart — a CLI that fans out work across goroutines, a desktop application, a service whose jobs are all "nice to have by tomorrow" and are re-derivable from your own database.
 
-**Wrong choice for:** handing work from a web tier to a worker fleet, or anything you would be upset to lose. Durable backends are [on the roadmap](/reference/roadmap).
+**Wrong choice for:** handing work from a web tier to a worker fleet, or anything you would be upset to lose. Use the [PostgreSQL backend](#postgresql) for that; SQLite and Redis remain [on the roadmap](/reference/roadmap).
 
 ### Test helpers
 
@@ -106,6 +106,43 @@ The snapshots are copies, so reading them while the backend is busy is safe and 
 `Client.Fake` is built on `Snapshot`, `SnapshotAll`, and `Reset`: `f.Job(id)`, `f.AssertPending(n)`, and `f.Reset()` are those three methods with assertions attached. Most of the time you want the fake rather than the backend directly. See [Testing Jobs](/testing).
 
 `SetCancelRequested` stands in for the remote cancellation API that does not exist yet. It exists so the cancellation delivery path — flag on the row, reported by `Heartbeat`, worker's context cancelled — can be tested end to end before there is a public way to request one.
+
+## PostgreSQL
+
+`backend/postgres` is a second, durable implementation. It stores jobs in PostgreSQL tables instead of a process-local map, so they survive a restart and are visible to every process pointed at the same database.
+
+```go
+import (
+	"github.com/swissy-dev/goque/backend/postgres"
+	"github.com/swissy-dev/goque/backend/postgres/pgxv5"
+)
+
+driver := pgxv5.New(pool)
+b, err := postgres.New(driver)
+```
+
+**pgx v5 is the only supported driver.** `postgres.Backend` carries every SQL statement the backend issues; `Driver` is the seam that isolates that SQL from pgx's connection mechanics, and `backend/postgres/pgxv5` is the adapter that implements the seam over a `*pgxpool.Pool`. There is no `database/sql` driver — not shipped, not planned. pgx v5 is a hard dependency of the `pgxv5` module alone; the root `goque` module and `backend/postgres` itself stay dependency-free.
+
+**Migrations ship separately, in `backend/postgres/goosemigrate`.** It applies goque's schema with [goose](https://github.com/pressly/goose), guarded by a PostgreSQL advisory lock so it is safe to run from every instance on every boot:
+
+```go
+import "github.com/swissy-dev/goque/backend/postgres/goosemigrate"
+
+if err := goosemigrate.Up(ctx, db, goosemigrate.WithSchema("public")); err != nil {
+	log.Fatal(err)
+}
+```
+
+`goosemigrate.Up` needs a `*sql.DB` because goose itself requires one. That dependency belongs to goose, not to the backend, and it stays confined to the `goosemigrate` module — it never reaches `backend/postgres` or the root library.
+
+**Capabilities.** `postgres.Backend` implements `backend.Backend` in full, plus two optional interfaces:
+
+- `backend.TxEnqueuer`, which powers `Client.EnqueueTx` and `Client.EnqueueManyTx` — enqueue inside a transaction the caller already opened.
+- `backend.TxCompleter`, which powers `goque.JobCompleteTx` — complete the currently running job inside the worker's own transaction.
+
+Both require a pgx v5 `pgx.Tx`; passing anything else returns an error wrapping `backend.ErrInvalidTx`. Neither method calls `Begin`, `Commit`, or `Rollback` — the caller owns that transaction's whole lifecycle. See [Enqueueing Jobs](/basics/enqueueing) and [Lifecycle & Guarantees](/reference/guarantees) for the patterns and what they do and do not guarantee.
+
+**What is not implemented yet.** pgx supports `LISTEN`/`NOTIFY`, but this backend does not use it: the client discovers new work by polling, same as against any other backend. Waking on a notification instead of a poll tick is future work — see the [Roadmap](/reference/roadmap).
 
 ## Writing your own
 
@@ -165,17 +202,18 @@ Before pointing the suite at your own implementation, run it against `memory.New
 
 ## What is not in the core interface
 
-The core contract deliberately stops at the eleven methods above. Everything else in the design — transactional enqueue, unique inserts, leader election, pause and resume, job listing, cluster-wide concurrency ceilings — is specified as an *optional capability interface* that a backend may additionally implement.
+The core contract deliberately stops at the eleven methods above. Everything else in the design — transactional enqueue and completion, unique inserts, leader election, pause and resume, job listing, cluster-wide concurrency ceilings — is specified as an *optional capability interface* that a backend may additionally implement.
 
 The client checks once at construction and refuses to start if you configured a feature the backend cannot provide.
 
-None of those capabilities are implemented yet, and neither are the durable backends that would implement them.
+Transactional enqueue (`backend.TxEnqueuer`) and transactional completion (`backend.TxCompleter`) are implemented today, by the [PostgreSQL backend](#postgresql). Unique inserts, leader election, pause and resume, job listing, and cluster-wide concurrency ceilings are not implemented by any backend yet, and neither are the durable backends beyond PostgreSQL that would need them.
 
 The reserved fields you will notice on `JobRow` — `ConcurrencyKey`, `ThrottleKey`, `DebounceKey`, `DebounceDeadline`, `Output` — belong to that future: a backend should store and return them, but nothing reads them today. See the [Roadmap](/reference/roadmap).
 
 ## See also
 
-- **[Roadmap](/reference/roadmap)** — the Postgres, SQLite, and Redis backends, and what they unlock.
+- **[Roadmap](/reference/roadmap)** — the SQLite and Redis backends, LISTEN/NOTIFY, and what else remains.
+- **[Enqueueing Jobs](/basics/enqueueing)** — the transactional enqueue pattern PostgreSQL enables.
 - **[Lifecycle & Guarantees](/reference/guarantees)** — the semantics the contract exists to uphold.
 - **[Testing Jobs](/testing)** — the fake, which is built on the memory backend.
 - **[The Client](/basics/client)** — what the client does with a backend once it has one.

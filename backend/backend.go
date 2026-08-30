@@ -442,3 +442,15 @@ type Backend interface {
 	// idempotent and concurrency-safe.
 	Clean(ctx context.Context, params CleanParams) (int, error)
 }
+
+// TxEnqueuer stores jobs inside a transaction owned by its caller.
+// Implementations validate tx but never commit or roll it back.
+type TxEnqueuer interface {
+	EnqueueTx(ctx context.Context, tx any, params EnqueueParams) error
+}
+
+// TxCompleter completes running jobs inside a transaction owned by its caller.
+// Implementations validate tx but never commit or roll it back.
+type TxCompleter interface {
+	CompleteTx(ctx context.Context, tx any, params CompleteParams) error
+}

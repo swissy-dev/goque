@@ -88,6 +88,7 @@ func (c *Client) runJob(ctx context.Context, row *JobRow, fin finalizer) {
 		default:
 		}
 	}()
+	jctx = withClient(jctx, c)
 	err := c.workOnce(jctx, row)
 	now := c.now()
 	switch {

@@ -17,6 +17,7 @@ import (
 type harness struct {
 	*postgres.Backend
 	d      postgres.Driver
+	pool   *pgxpool.Pool
 	schema string
 }
 
@@ -40,7 +41,7 @@ func newHarness(t *testing.T) *harness {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &harness{Backend: b, d: d, schema: schema}
+	return &harness{Backend: b, d: d, pool: pool, schema: schema}
 }
 
 type stored struct {

@@ -66,6 +66,16 @@ func (b *Backend) completeOn(ctx context.Context, d Driver, params backend.Compl
 	return b.runFinalize(ctx, d, "complete", completeSet, rows, ids, params.Now.UTC())
 }
 
+// CompleteTx completes running jobs on a caller-owned transaction. It never
+// commits or rolls back tx.
+func (b *Backend) CompleteTx(ctx context.Context, tx any, params backend.CompleteParams) error {
+	d, err := b.d.InTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return b.completeOn(ctx, d, params)
+}
+
 // Retry implements [backend.Backend]. Each entry carries its own At and Err, so
 // one call may reschedule different jobs to different instants. PriorityAt is
 // re-derived from At and the job's stored PriorityBoost. It is fenced like

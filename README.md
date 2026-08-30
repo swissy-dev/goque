@@ -4,7 +4,7 @@ A background job and scheduling library for Go: typed jobs with generics, plugga
 
 **Zero dependencies.** The library and its test helpers use only the standard library.
 
-> **Status: early.** The core engine and the in-memory backend are complete and tested. The Postgres, SQLite, and Redis backends — plus cron, unique jobs, and rate limiting — are designed but **not yet implemented**. See [Roadmap](#roadmap). The in-memory backend keeps jobs in the process that enqueued them, so today goque fits single-process apps, tests, and anything that runs its workers in the same binary.
+> **Status: early.** The core engine, the in-memory backend, and the PostgreSQL backend (on pgx v5) are complete and tested. SQLite, Redis, cron, unique jobs, rate limiting, and LISTEN/NOTIFY wakeups remain future work. See [Roadmap](#roadmap). The in-memory backend keeps jobs in the process that enqueued them, so it fits single-process apps, tests, and anything that runs its workers in the same binary. PostgreSQL is what lets a web tier hand work to a separate worker fleet durably, with transactional enqueue and worker-side transactional completion available today.
 
 ## Documentation
 
@@ -33,6 +33,7 @@ This README is the condensed tour; the site covers each topic properly.
 - [Testing](#testing)
 - [One-shot processing](#one-shot-processing)
 - [Lifecycle and guarantees](#lifecycle-and-guarantees)
+- [PostgreSQL](#postgresql)
 - [Writing a backend](#writing-a-backend)
 - [Roadmap](#roadmap)
 
@@ -496,7 +497,7 @@ A few boundaries worth knowing: `WithTimeout` deadlines and middleware durations
 results, err := client.ProcessReady(ctx, "default", "bulk")
 ```
 
-It promotes due jobs, then runs everything currently available in the named queues on the calling goroutine, returning one `JobResult` per execution with its `Outcome` (`OutcomeCompleted`, `OutcomeRetried`, `OutcomeCancelled`, `OutcomeDead`, `OutcomeSnoozed`). It honors context cancellation, returning the results so far alongside the error, so an invocation deadline stops the pass cleanly instead of failing the remaining backlog. Use it on a client you have not started.
+It promotes due jobs, then runs everything currently available in the named queues on the calling goroutine, returning one `JobResult` per execution with its `Outcome` (`OutcomeCompleted`, `OutcomeRetried`, `OutcomeCancelled`, `OutcomeDead`, `OutcomeSnoozed`). When a worker finalized a job with `JobCompleteTx` and that transaction committed, `Outcome` reports what the executor submitted rather than what was actually stored, so a `retried` or `cancelled` result here can belong to a job that is in fact completed. It honors context cancellation, returning the results so far alongside the error, so an invocation deadline stops the pass cleanly instead of failing the remaining backlog. Use it on a client you have not started.
 
 ## Lifecycle and guarantees
 
@@ -509,6 +510,81 @@ Crashed workers are handled by heartbeats: a running job whose heartbeat goes st
 `Start(ctx)` launches fetchers, the completer, and the mover/rescuer/cleaner maintenance loops; cancelling `ctx` stops fetching new work and the maintenance loops, but in-flight jobs keep running and keep heartbeating, so you still call `Stop` to drain. `Stop(ctx)` stops fetching and drains in-flight jobs, continuing to heartbeat throughout so the cluster does not mistake draining work for dead work. If the drain outlasts your deadline, it cancels the stragglers' contexts, allows a brief grace period, and returns the context error while a background finisher completes the drain. `StopAndCancel(ctx)` cancels running jobs' contexts immediately instead.
 
 Finalized jobs are cleaned up on a retention schedule: completed after 24h, cancelled and dead after 7 days, all configurable.
+
+## PostgreSQL
+
+`backend/postgres` is goque's durable backend. It is production-facing today, with [pgx v5](https://github.com/jackc/pgx) — via the `backend/postgres/pgxv5` adapter — as its only supported driver. Jobs written to PostgreSQL survive a restart and are visible to every process pointed at the same database, so a web tier can enqueue work that a separate worker fleet claims.
+
+pgx lives in its own module. The root `goque` module and the `backend/postgres` module that holds all of the backend's SQL stay dependency-free; only `backend/postgres/pgxv5` imports pgx.
+
+```go
+pool, err := pgxpool.New(ctx, dsn)
+if err != nil {
+	log.Fatal(err)
+}
+
+driver := pgxv5.New(pool)
+store, err := postgres.New(driver)
+if err != nil {
+	log.Fatal(err)
+}
+client, err := goque.NewClient(store, &goque.Config{Workers: workers})
+if err != nil {
+	log.Fatal(err)
+}
+```
+
+Run the migrations in `backend/postgres/goosemigrate` against a fresh database before starting a client against it.
+
+### Transactional enqueue
+
+`Client.EnqueueTx` and `Client.EnqueueManyTx` take a transaction the caller already opened, so a job can be created atomically with the business data that justifies it. goque never calls `Begin`, `Commit`, or `Rollback` on that transaction — the caller alone owns its lifecycle, and with the PostgreSQL backend the transaction must be a pgx v5 `pgx.Tx`.
+
+```go
+tx, err := pool.Begin(ctx)
+if err != nil {
+	return err
+}
+defer tx.Rollback(ctx)
+
+if err := createUser(ctx, tx, user); err != nil {
+	return err
+}
+if _, err := client.EnqueueTx(ctx, tx, SendWelcomeEmail{UserID: user.ID}); err != nil {
+	return err
+}
+
+return tx.Commit(ctx)
+```
+
+Roll the transaction back and the job was never created. Commit it and both the user and the job are there — no outbox table, no reconciliation sweep.
+
+### Transactional completion
+
+`goque.JobCompleteTx` couples a worker's own database writes to the job's completion, inside the worker's own transaction:
+
+```go
+func (w *ChargeWorker) Work(ctx context.Context, job *goque.Job[ChargeCard]) error {
+	tx, err := w.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := recordCharge(ctx, tx, job.Args); err != nil {
+		return err
+	}
+	if err := goque.JobCompleteTx(ctx, tx, job); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
+When that commit succeeds, the executor's own ordinary finalization still runs after `Work` returns, finds the job already completed, and drops itself harmlessly. When the transaction rolls back instead, ordinary finalization applies out of band, so the job retries rather than being stranded.
+
+This is not global exactly-once execution: a crash between `Work` returning and that transaction committing can still cause the job to run again, and nothing here helps a side effect outside the transaction, such as an outbound email or HTTP call. `JobCompleteTx` closes the gap only for writes made inside the same transaction. Ordinary processing is still **at-least-once** — write idempotent workers regardless. See [Lifecycle and guarantees](#lifecycle-and-guarantees).
 
 ## Writing a backend
 
@@ -526,11 +602,12 @@ It covers claim exclusivity under concurrency, effective-time ordering, generati
 
 ## Roadmap
 
-Implemented today: the core engine, the in-memory backend, the conformance suite, and the testing story.
+Implemented today: the core engine, the in-memory backend, the PostgreSQL backend on pgx v5 — including transactional enqueue (`EnqueueTx`/`EnqueueManyTx`) and transactional completion (`JobCompleteTx`) — the conformance suite, and the testing story.
 
 Designed and specced, not yet built:
 
-- **Postgres, SQLite, and Redis backends**, including transactional enqueue (`EnqueueTx`) so job creation commits atomically with your business data
+- **SQLite and Redis backends**
+- **LISTEN/NOTIFY wakeups for PostgreSQL** — the client still discovers new work by polling; pgx supports LISTEN, but nothing here uses it yet
 - **Enqueue-only clients** — a dedicated `Enqueuer` type for API processes that produce work but never run it, without the registry, the dispatcher, or a `Start` to call by mistake
 - **Enqueueing from other languages** — the wire contract written down and versioned, plus a TypeScript package, so a Node service can hand work to a Go worker
 - **Cron and periodic jobs**, with leader election and no-overlap scheduling

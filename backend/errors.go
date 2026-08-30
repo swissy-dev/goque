@@ -12,7 +12,7 @@ var (
 	// jobs were affected by returning a [*StaleError].
 	ErrStaleAttempt = errors.New("goque: stale attempt")
 	// ErrNotSupported reports that a backend does not implement an optional
-	// feature. It is reserved: no shipped code returns it yet.
+	// capability requested by the client.
 	ErrNotSupported = errors.New("goque: not supported by backend")
 	// ErrDuplicate reports that an insert was rejected as a duplicate of a job
 	// already stored. It is reserved for deduplicated enqueues, which are not
@@ -22,8 +22,7 @@ var (
 	// for queue pausing, which is not implemented yet.
 	ErrQueuePaused = errors.New("goque: queue paused")
 	// ErrInvalidTx reports that a caller passed a transaction handle of a type
-	// the backend does not understand. It is reserved for transactional
-	// enqueues, which are not implemented yet.
+	// the selected backend driver does not understand.
 	ErrInvalidTx = errors.New("goque: invalid transaction type")
 	// ErrAlreadyFinalized reports an operation on a job that has already
 	// reached a terminal state. It is reserved: backends report that case as a

@@ -1,9 +1,10 @@
-// Package postgres implements a durable goque backend on PostgreSQL.
+// Package postgres implements goque's PostgreSQL backend. pgx v5, through the
+// sibling pgxv5 package, is its only supported driver.
 //
-// Every SQL statement the backend issues lives in this package. A Driver
-// supplies only connection handling, which is what makes the pgx and
-// database/sql paths provably interchangeable: they run identical SQL and the
-// same conformance suite.
+// Every SQL statement the backend issues lives in this package. The Driver
+// seam isolates that SQL from pgx's connection mechanics, which keeps this
+// package testable against a narrow interface instead of a concrete pgx
+// type.
 package postgres
 
 import "context"
@@ -39,10 +40,10 @@ type Driver interface {
 	// that must not move between sessions — holding a LISTEN, or a
 	// session-scoped advisory lock.
 	Conn(ctx context.Context) (Conn, error)
-	// InTx adapts a caller-supplied transaction — a *sql.Tx or a pgx.Tx — into
-	// a Driver scoped to it, so a job can be enqueued inside the transaction
-	// that created the reason for it. It returns backend.ErrInvalidTx when tx
-	// is not a type this driver understands.
+	// InTx adapts a caller-supplied transaction into a Driver scoped to it, so
+	// a job can be enqueued or completed inside the transaction that created
+	// the reason for it. The shipped pgx v5 adapter accepts a pgx.Tx; it
+	// returns backend.ErrInvalidTx when tx is anything else.
 	InTx(ctx context.Context, tx any) (Driver, error)
 	// SQLState returns the five-character SQLSTATE code a database error
 	// carries, or an empty string when err is nil or did not come from the
