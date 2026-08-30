@@ -3,13 +3,16 @@
   "private": true,
   "type": "module",
   "scripts": {
-    "dev": "vocs dev",
-    "build": "vocs build",
-    "preview": "vocs preview"
+    "dev": "blume dev",
+    "build": "blume build",
+    "preview": "blume preview",
+    "deploy": "wrangler deploy",
+    "preview:cf": "wrangler dev"
   },
   "dependencies": {
-    "vite": "^8.1.5",
-    "vocs": "^2.6.2",
-    "waku": "^1.0.0-beta.8"
+    "blume": "^1.5.3"
+  },
+  "devDependencies": {
+    "wrangler": "^4.127.1"
   }
 }

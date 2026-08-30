@@ -31,7 +31,7 @@ An option can be set in three places, and they resolve in this order:
 
 Whichever layer sets a field first, going down that list, wins. Here is all three at once. The client sets a house style:
 
-```go [main.go]
+```go main.go
 client, err := goque.NewClient(memory.New(), &goque.Config{
 	Workers: workers,
 	Defaults: goque.JobOptions{
@@ -44,7 +44,7 @@ client, err := goque.NewClient(memory.New(), &goque.Config{
 
 The `ResizeImage` kind knows things the client does not — image work belongs on its own queue, it is slower than a minute, and a broken upload is not worth ten attempts:
 
-```go [jobs.go]
+```go jobs.go
 type ResizeImage struct {
 	ImageID string `json:"image_id"`
 	Width   int    `json:"width"`

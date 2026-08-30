@@ -34,7 +34,7 @@ The job is stored by the same backend, claimed by the same fetch, decoded by the
 
 `Fake` wraps a client you have already built, so your test exercises the same construction path as production.
 
-```go [reminder_test.go]
+```go reminder_test.go
 func TestTrialReminderWaitsADay(t *testing.T) {
 	var sent []string
 
@@ -194,7 +194,7 @@ The copy is a snapshot. Mutating it changes nothing.
 
 This is the test that is genuinely awkward to write any other way. A webhook delivery fails, backs off, and succeeds on the second attempt — asserted at every step, in about a millisecond.
 
-```go [webhook_test.go]
+```go webhook_test.go
 func TestWebhookRetriesAfterBackoff(t *testing.T) {
 	var attempts int
 

@@ -67,7 +67,7 @@ A closure that needs a database reaches for a package-level variable or captures
 If you find yourself capturing anything other than the job's own arguments inside a `RegisterFunc` closure, that is the signal to promote it to a struct.
 :::
 
-:::details[Why `Register` is a function and not a method]
+<Expandable title="Why Register is a function and not a method">
 You would expect `workers.Register(...)`, and Go will not let you have it.
 
 Registration has to be generic — it needs `T` to know how to decode the payload and what to hand your `Work` method. But **Go does not permit a method to declare its own type parameters.** A method can only use type parameters that its receiver already has.
@@ -75,8 +75,7 @@ Registration has to be generic — it needs `T` to know how to decode the payloa
 That leaves two options. Either `Workers` becomes `Workers[T]`, which defeats the purpose — a registry exists precisely to hold *many* different job types at once, and a `Workers[SendEmail]` could hold exactly one. Or registration moves to a package-level function, where it is free to introduce `T` on its own.
 
 goque takes the second, which is why every registration call reads `goque.Register(workers, …)` with the registry as the first argument. It looks slightly unusual, and it is the only shape the language allows.
-:::
-
+</Expandable>
 ## Inside `Work`
 
 Your worker receives a `*goque.Job[T]`, which is two things fused together: your decoded arguments, and the stored job row.

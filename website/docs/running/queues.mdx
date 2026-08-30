@@ -13,7 +13,7 @@ Queues exist to make that impossible. A queue is a lane: work in one lane never 
 
 `Config.Queues` maps a queue name to how that queue is worked. A client processes exactly the queues listed here and no others.
 
-```go [worker/main.go]
+```go worker/main.go
 client, err := goque.NewClient(memory.New(), &goque.Config{
 	Workers: workers,
 	Queues: map[string]goque.QueueConfig{
@@ -154,7 +154,7 @@ A queue is not a declared resource. Nothing registers it, nothing creates it, an
 
 That is what makes an enqueue-only client possible. A client with no `Queues` at all can still insert:
 
-```go [api/main.go]
+```go api/main.go
 client, err := goque.NewClient(memory.New(), &goque.Config{})
 if err != nil {
 	return err

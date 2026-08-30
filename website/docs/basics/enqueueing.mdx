@@ -51,7 +51,7 @@ Both are programmer errors that surface on the first call.
 
 An HTTP handler is the canonical case: do the small synchronous thing, queue the slow thing, respond.
 
-```go [handler.go]
+```go handler.go
 func (h *signupHandler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	var req signupRequest
 	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {

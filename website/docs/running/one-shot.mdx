@@ -19,17 +19,18 @@ One synchronous pass, on your goroutine. It returns when there is nothing left t
 
 ## What a pass does
 
-::::steps
-
-##### Promote everything due
+<Steps>
+  <Step title="Promote everything due">
 
 The pass starts by doing the mover's job: every scheduled job whose time has come, and every retryable job whose backoff has elapsed, becomes available. A job you enqueued with a two-hour delay two hours ago will run in this pass, even though no background loop has been alive in between.
 
-##### Work each queue, in the order you named it
+  </Step>
+  <Step title="Work each queue, in the order you named it">
 
 `ProcessReady(ctx, "critical", "default")` drains `critical` completely, then drains `default`. The argument order is a priority order, not a set — a busy `critical` queue is emptied before `default` is touched at all. There is no weighting here and no round-robin, because there is no contention: nothing is running in parallel.
 
-##### Return one result per execution
+  </Step>
+  <Step title="Return one result per execution">
 
 ```go
 for _, r := range results {
@@ -37,8 +38,8 @@ for _, r := range results {
 }
 ```
 
-::::
-
+  </Step>
+</Steps>
 Each `goque.JobResult` carries the `JobRow` as it was handed to the worker — so `r.Job.Attempt` is the attempt that just ran — plus an `Outcome` and, for failures, the error's message:
 
 | Outcome | Meaning |
@@ -97,7 +98,7 @@ On a client you have not started, there is no rescuer, and the point is moot —
 
 The canonical deployment: a container that runs to completion every minute.
 
-```go [cmd/drain/main.go]
+```go cmd/drain/main.go
 package main
 
 import (

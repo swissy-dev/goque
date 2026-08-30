@@ -198,7 +198,7 @@ And a Go function pointer cannot be written to a database row — but a *name* c
 
 So you register the function once and refer to it by name:
 
-```go [main.go]
+```go main.go
 goque.RegisterRetryPolicy("business-hours", func(attempt int) time.Duration {
 	next := time.Now().Add(time.Duration(attempt) * 10 * time.Minute)
 	if h := next.Hour(); h < 9 || h >= 17 {

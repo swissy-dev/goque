@@ -11,7 +11,7 @@ description: Recipes for the tests you actually write — HTTP handlers that enq
 
 This is the canonical case, and the one that pays for the whole feature. A signup endpoint creates the user, hands a welcome email to the queue, and returns — the request must not wait for SMTP.
 
-```go [app.go]
+```go app.go
 type App struct {
 	mux   *http.ServeMux
 	queue *goque.Client
@@ -39,7 +39,7 @@ func (a *App) signup(w http.ResponseWriter, r *http.Request) {
 
 The client is injected, so the test can hand it a faked one without the handler knowing or caring.
 
-```go [app_test.go]
+```go app_test.go
 func TestSignupSchedulesWelcomeEmail(t *testing.T) {
 	var sent []string
 
@@ -98,7 +98,7 @@ if row.Queue != "email" {
 
 Many suites build the whole application in `TestMain` — config, templates, a database pool, the worker registry — because building it per test is too slow. A goque client fits that shape fine; it just needs two lines per test.
 
-```go [main_test.go]
+```go main_test.go
 var (
 	app    *App
 	client *goque.Client
@@ -139,7 +139,7 @@ A `Fake` and its client share one clock. Two tests running concurrently against 
 
 So: **tests that share a client must run sequentially.** No `t.Parallel()`.
 
-```go [sequential_test.go]
+```go sequential_test.go
 func TestDigestIsScheduled(t *testing.T) {
 	f := client.Fake(t)	// shared client from TestMain
 	t.Cleanup(f.Reset)
@@ -152,7 +152,7 @@ func TestDigestIsScheduled(t *testing.T) {
 
 If you want parallelism, give each test its own client. Construction is a struct literal and a map copy — microseconds — so there is no reason to hoard one.
 
-```go [parallel_test.go]
+```go parallel_test.go
 func newTestClient(t *testing.T) *goque.Client {
 	t.Helper()
 	workers := goque.NewWorkers()
@@ -183,7 +183,7 @@ Each test gets its own backend, its own clock, and its own job IDs starting at 1
 
 Fan-out is common: one job discovers the work and enqueues a job per unit of it. `RunUntilIdle` runs the whole cascade in one call, without advancing the clock.
 
-```go [fanout_test.go]
+```go fanout_test.go
 func TestMonthlyReportFansOutPerTenant(t *testing.T) {
 	var client *goque.Client
 	var built []string
@@ -235,7 +235,7 @@ Advancing time will not run a job that is already due; only a run does. And `Run
 
 A job that fails forever should end up dead, with its error history intact — not retried in perpetuity, and not silently discarded. Pin a fixed backoff and a small attempt budget, and the whole life story fits in a dozen lines.
 
-```go [dead_test.go]
+```go dead_test.go
 func TestWebhookGoesDeadAfterThreeAttempts(t *testing.T) {
 	workers := goque.NewWorkers()
 	goque.RegisterFunc(workers, func(ctx context.Context, job *goque.Job[DeliverWebhook]) error {
@@ -283,7 +283,7 @@ The same shape tests a panicking worker: a panic is recovered, recorded as a fai
 
 `Cancel` and `SnoozeFor` are the two outcomes people forget to test, and both are easy to get backwards. Here is a worker that uses each for its proper purpose — cancel when the work has become pointless, snooze when it is merely too early.
 
-```go [charge.go]
+```go charge.go
 func (w *ChargeWorker) Work(ctx context.Context, job *goque.Job[ChargeInvoice]) error {
 	inv, err := w.Store.Invoice(ctx, job.Args.InvoiceID)
 	if err != nil {

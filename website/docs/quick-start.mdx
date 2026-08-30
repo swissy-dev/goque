@@ -9,9 +9,8 @@ We are going to build a small program that sends a welcome email in the backgrou
 
 Four things happen in every goque application, in this order:
 
-::::steps
-
-##### Define a job
+<Steps>
+  <Step title="Define a job">
 
 A job is a struct that reports a stable `Kind`.
 
@@ -26,7 +25,8 @@ func (SendEmail) Kind() string { return "email.send" }
 
 The struct is your payload — it gets serialized as JSON, so exported fields with tags are what survives. `Kind` is the name stored with the job and used to find its worker, so pick one you can live with.
 
-##### Write a worker
+  </Step>
+  <Step title="Write a worker">
 
 A worker is a struct with a `Work` method.
 
@@ -57,7 +57,8 @@ type EmailWorker struct {
 
 That is what keeps a worker testable: you build it with a stub in a test exactly as you build it with the real thing here. See [Workers](/basics/workers).
 
-##### Create a client
+  </Step>
+  <Step title="Create a client">
 
 The client owns the backend, the worker registry, and the queues you want processed.
 
@@ -72,7 +73,8 @@ client, err := goque.NewClient(memory.New(), &goque.Config{
 
 `Concurrency: 10` means up to ten `default` jobs run at once in this process.
 
-##### Start it, then enqueue
+  </Step>
+  <Step title="Start it, then enqueue">
 
 ```go
 client.Start(ctx)
@@ -82,11 +84,11 @@ client.Enqueue(ctx, SendEmail{To: "ada@example.com", Subject: "Welcome!"})
 
 `Start` launches the workers in the background and returns immediately. `Enqueue` hands over a job and returns as soon as it is stored — your request path never waits for the work itself.
 
-::::
-
+  </Step>
+</Steps>
 ## The whole program
 
-```go [main.go]
+```go main.go
 package main
 
 import (

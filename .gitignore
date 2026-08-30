@@ -1,10 +1,9 @@
 node_modules/
 website/dist/
-website/.vocs/
+website/.blume/
 .DS_Store
-website/pnpm-lock.yaml
-website/pnpm-workspace.yaml
 
 # Internal design docs and implementation plans — deliberately not published.
 docs/superpowers/
 go.work.sum
+website/.wrangler/

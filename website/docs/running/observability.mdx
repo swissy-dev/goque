@@ -94,7 +94,7 @@ for _, prev := range job.Errors {
 
 The example below is Prometheus-shaped but depends on nothing — swap the two interfaces for `*prometheus.GaugeVec` and `*prometheus.HistogramVec` and the code is unchanged.
 
-```go [metrics.go]
+```go metrics.go
 type Gauge interface {
 	Inc()
 	Dec()

@@ -116,7 +116,7 @@ Every finalizing transition is therefore a compare-and-set on `(id, generation, 
 
 The zombie cannot complete a job that a live worker is retrying, cannot mark it dead, and cannot reschedule it. Heartbeats are fenced the same way, so a stale executor also cannot keep a reclaimed job alive or mask the real owner's death.
 
-:::details[Why `Attempt` and `Generation` are separate counters]
+<Expandable title="Why Attempt and Generation are separate counters">
 They look redundant. Both increment on every claim, so the obvious design is to use the attempt number as the fencing token and store one integer instead of two.
 
 That design breaks on snooze.
@@ -130,8 +130,7 @@ Collapse them and the refund becomes a security hole. A job is claimed at attemp
 If the first one's snooze arrives late, perhaps because it was retrying against a slow backend, it matches the CAS and reschedules an execution that is *currently running*, moving a live job's schedule out from under it.
 
 Keeping `Generation` monotonic makes that impossible: the replayed snooze carries generation 1, the live execution holds generation 2, and the replay is rejected. The conformance suite tests exactly this case, because it is the kind of bug that surfaces once a quarter in production and never in development.
-:::
-
+</Expandable>
 ## Ordering
 
 Within a queue, jobs are fetched in **effective time** order — `ScheduledAt` minus `PriorityBoost` — and ties are broken by ID.

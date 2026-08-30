@@ -208,7 +208,7 @@ You will rarely set `Now` by hand. `client.Fake(t)` takes it over for you and gi
 
 A typical working client, with the fields most applications actually set:
 
-```go [main.go]
+```go main.go
 workers := goque.NewWorkers()
 if err := goque.Register(workers, NewResizeWorker(images, db)); err != nil {
 	log.Fatal(err)
