@@ -17,8 +17,10 @@ type WorkFunc func(ctx context.Context, job *JobRow) error
 type Middleware func(next WorkFunc) WorkFunc
 
 // EnqueueFunc inserts a batch of already-built job rows. It is the step that
-// [EnqueueMiddleware] wraps, and it is called once per [Client.Enqueue] or
-// [Client.EnqueueMany] call.
+// [EnqueueMiddleware] wraps, and it is called once per [Client.Enqueue],
+// [Client.EnqueueMany], [Client.EnqueueTx], or [Client.EnqueueManyTx] call.
+// The transaction handle passed to the Tx variants is not visible to
+// middleware.
 type EnqueueFunc func(ctx context.Context, jobs []*JobRow) error
 
 // EnqueueMiddleware wraps job insertion, the natural place to stamp

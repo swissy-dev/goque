@@ -166,7 +166,7 @@ client.Enqueue(ctx, ResizeImage{ImageID: img.ID, Width: 1600}, goque.WithQueue("
 This client will refuse to `Start` — which is how forgetting your queues surfaces loudly instead of silently processing nothing. See [The Client](/basics/client).
 
 :::note
-Splitting producer and consumer across processes needs a backend both processes can see. The in-memory backend keeps jobs inside the process that enqueued them, so today this shape is for one binary that both enqueues and works. Shared backends are on the [Roadmap](/reference/roadmap).
+Splitting producer and consumer across processes needs a backend both processes can see. The in-memory backend keeps jobs inside the process that enqueued them, so with it this shape is for one binary that both enqueues and works. The PostgreSQL backend has no such limit — an enqueue-only process and a separate worker fleet can point at the same database and share every queue. See [Backends](/reference/backends#postgresql).
 :::
 
 ## Choosing your lanes

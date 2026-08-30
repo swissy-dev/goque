@@ -8,6 +8,7 @@ import (
 	"sync"
 	"time"
 
+	"github.com/swissy-dev/goque/backend"
 	"github.com/swissy-dev/goque/backend/memory"
 )
 
@@ -400,6 +401,6 @@ func RunWorker[T JobArgs](ctx context.Context, w Worker[T], args T) error {
 	if err := json.Unmarshal(payload, &decoded); err != nil {
 		return fmt.Errorf("goque: decode %s payload: %w", args.Kind(), err)
 	}
-	row := &JobRow{Kind: args.Kind(), Payload: payload, Attempt: 1, Generation: 1, MaxAttempts: 1}
+	row := &JobRow{Kind: args.Kind(), Payload: payload, Attempt: 1, Generation: 1, MaxAttempts: 1, State: backend.StateRunning}
 	return w.Work(ctx, &Job[T]{JobRow: row, Args: decoded})
 }

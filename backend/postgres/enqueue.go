@@ -49,6 +49,16 @@ func (b *Backend) Enqueue(ctx context.Context, params backend.EnqueueParams) err
 	return b.enqueueOn(ctx, b.d, params)
 }
 
+// EnqueueTx stores jobs on a caller-owned transaction. It never commits or
+// rolls back tx.
+func (b *Backend) EnqueueTx(ctx context.Context, tx any, params backend.EnqueueParams) error {
+	d, err := b.d.InTx(ctx, tx)
+	if err != nil {
+		return err
+	}
+	return b.enqueueOn(ctx, d, params)
+}
+
 func (b *Backend) enqueueOn(ctx context.Context, d Driver, params backend.EnqueueParams) error {
 	if len(params.Jobs) == 0 {
 		return nil

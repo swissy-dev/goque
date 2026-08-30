@@ -49,6 +49,12 @@ Each `goque.JobResult` carries the `JobRow` as it was handed to the worker — s
 | `goque.OutcomeDead` | The attempt failed and it was the job's last. Retained with its error history. |
 | `goque.OutcomeSnoozed` | The worker returned `goque.SnoozeFor(d)`. Rescheduled, no attempt consumed. |
 
+:::warning[Outcomes report what was submitted, not what was applied]
+`Outcome` is the finalization the executor *submitted* for the attempt. Almost always that is also the one that landed — but if the worker used [`JobCompleteTx`](/reference/guarantees#closing-the-gap-with-jobcompletetx) and its transaction committed, the executor's own finalization is fenced out as stale and dropped. A worker that commits `JobCompleteTx` and then returns an error therefore reports `OutcomeRetried` with that error for a job the database has already stored as `completed`.
+
+This only affects workers using `JobCompleteTx`. If you drive `ProcessReady` in a cron container and alert on retries, read the job's state back rather than trusting the outcome for those workers.
+:::
+
 Which makes an invocation summary a fold over the slice:
 
 ```go

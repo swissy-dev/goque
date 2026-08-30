@@ -3,8 +3,12 @@ package postgres
 import (
 	"context"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
+	"time"
+
+	"github.com/swissy-dev/goque/backend"
 )
 
 func TestSchemaValidation(t *testing.T) {
@@ -86,3 +90,113 @@ func (stubDriver) Begin(context.Context) (Tx, error)                   { return 
 func (stubDriver) Conn(context.Context) (Conn, error)                  { return nil, nil }
 func (stubDriver) InTx(context.Context, any) (Driver, error)           { return nil, nil }
 func (stubDriver) SQLState(error) string                               { return "" }
+
+type recordingDriver struct {
+	stubDriver
+	txSeen  any
+	tx      Driver
+	err     error
+	rows    Rows
+	queried bool
+}
+
+func (d *recordingDriver) Query(context.Context, string, ...any) (Rows, error) {
+	d.queried = true
+	return d.rows, nil
+}
+
+func (d *recordingDriver) InTx(_ context.Context, tx any) (Driver, error) {
+	d.txSeen = tx
+	return d.tx, d.err
+}
+
+type idRows struct {
+	ids  []int64
+	next int
+}
+
+func (r *idRows) Next() bool {
+	if r.next >= len(r.ids) {
+		return false
+	}
+	r.next++
+	return true
+}
+
+func (r *idRows) Scan(dest ...any) error {
+	*dest[0].(*int64) = r.ids[r.next-1]
+	return nil
+}
+
+func (r *idRows) Err() error   { return nil }
+func (r *idRows) Close() error { return nil }
+
+func TestTransactionalCapabilitiesUseCallerDriver(t *testing.T) {
+	t.Run("EnqueueTx", func(t *testing.T) {
+		scoped := &recordingDriver{rows: &idRows{ids: []int64{1}}}
+		outer := &recordingDriver{tx: scoped, rows: &idRows{ids: []int64{1}}}
+		b, err := New(outer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle := &struct{ name string }{name: "caller tx"}
+		params := backend.EnqueueParams{
+			Jobs: []*backend.JobRow{{Kind: "test-kind", Queue: "test-queue"}},
+			Now:  time.Now(),
+		}
+
+		if err := b.EnqueueTx(context.Background(), handle, params); err != nil {
+			t.Fatal(err)
+		}
+		if outer.txSeen != handle {
+			t.Fatalf("EnqueueTx passed %p, want exact handle %p", outer.txSeen, handle)
+		}
+		if outer.queried {
+			t.Fatal("EnqueueTx queried the pool-scoped driver, want it to query only the driver InTx returned")
+		}
+		if !scoped.queried {
+			t.Fatal("EnqueueTx never queried the driver InTx returned")
+		}
+	})
+
+	t.Run("CompleteTx", func(t *testing.T) {
+		scoped := &recordingDriver{rows: &idRows{ids: []int64{1}}}
+		outer := &recordingDriver{tx: scoped, rows: &idRows{ids: []int64{1}}}
+		b, err := New(outer)
+		if err != nil {
+			t.Fatal(err)
+		}
+		handle := &struct{ name string }{name: "caller tx"}
+		params := backend.CompleteParams{
+			Jobs: []backend.JobFinalize{{ID: 1, Generation: 1}},
+			Now:  time.Now(),
+		}
+
+		if err := b.CompleteTx(context.Background(), handle, params); err != nil {
+			t.Fatal(err)
+		}
+		if outer.txSeen != handle {
+			t.Fatalf("CompleteTx passed %p, want exact handle %p", outer.txSeen, handle)
+		}
+		if outer.queried {
+			t.Fatal("CompleteTx queried the pool-scoped driver, want it to query only the driver InTx returned")
+		}
+		if !scoped.queried {
+			t.Fatal("CompleteTx never queried the driver InTx returned")
+		}
+	})
+}
+
+func TestTransactionalCapabilitiesPropagateInvalidTx(t *testing.T) {
+	d := &recordingDriver{err: fmt.Errorf("%w: foreign", backend.ErrInvalidTx)}
+	b, err := New(d)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := b.EnqueueTx(context.Background(), "bad", backend.EnqueueParams{}); !errors.Is(err, backend.ErrInvalidTx) {
+		t.Fatalf("EnqueueTx error = %v, want ErrInvalidTx", err)
+	}
+	if err := b.CompleteTx(context.Background(), "bad", backend.CompleteParams{}); !errors.Is(err, backend.ErrInvalidTx) {
+		t.Fatalf("CompleteTx error = %v, want ErrInvalidTx", err)
+	}
+}

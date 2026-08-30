@@ -170,6 +170,35 @@ Three control errors override the default behavior when the outcome is not simpl
 
 [Error Handling](/configuration/errors) covers them properly.
 
+### Completing inside your own transaction
+
+Returning `nil` lets the executor record the completion for you, a moment after `Work` returns. That gap is why ordinary processing is at-least-once: a crash in between re-runs the job, side effects and all.
+
+When the job's side effects are writes to the same PostgreSQL database goque uses, you can close that gap by completing the job yourself, inside your transaction:
+
+```go
+func (w *ChargeWorker) Work(ctx context.Context, job *goque.Job[ChargeCard]) error {
+	tx, err := w.Pool.Begin(ctx)
+	if err != nil {
+		return err
+	}
+	defer tx.Rollback(ctx)
+
+	if err := recordCharge(ctx, tx, job.Args); err != nil {
+		return err
+	}
+	if err := goque.JobCompleteTx(ctx, tx, job); err != nil {
+		return err
+	}
+
+	return tx.Commit(ctx)
+}
+```
+
+Commit and the charge and the completion land together. Roll back and neither did, so the job retries normally. You still own `Begin`, `Commit`, and `Rollback` — goque never touches them.
+
+This narrows the at-least-once window to zero for writes in that transaction, and does nothing for side effects outside it. [Lifecycle & Guarantees](/reference/guarantees#closing-the-gap-with-jobcompletetx) explains what it does and does not buy you.
+
 ## Registration rules
 
 Two things about the registry are worth internalizing, because both fail in ways that are easier to understand up front than to debug later.

@@ -63,7 +63,7 @@ f.RunReady(ctx).AssertRan("email.trial-reminder")
 
 No sleeps, no goroutines, no flakes — and the job runs through the real executor, with your real middleware and your real retry policy. It is not a mock of the queue; it is the queue, with the clock in your hand.
 
-**Zero dependencies.** The library and its test helpers import nothing outside the standard library. Adding goque to a project adds exactly one module to your `go.mod` and nothing to your dependency audit.
+**Zero dependencies.** The library and its test helpers import nothing outside the standard library. Adding goque to a project with the in-memory backend adds exactly one module to your `go.mod` and nothing to your dependency audit. The root module stays dependency-free even once you add PostgreSQL — pgx v5 lives entirely in the separate adapter module that backend uses.
 
 ## Correctness you don't have to think about
 
@@ -80,9 +80,9 @@ Execution is **at-least-once**. Claiming is exactly-once, but a process that cra
 ## Where it fits today
 
 :::warning[Early days]
-The core engine, the in-memory backend, and the testing story are complete and tested. The Postgres, SQLite, and Redis backends — along with cron, unique jobs, and rate limiting — are designed but **not yet implemented**.
+The core engine, the in-memory backend, the testing story, and the PostgreSQL backend (on pgx v5) are complete and tested. SQLite, Redis, cron, unique jobs, and rate limiting are designed but **not yet implemented**.
 
-The in-memory backend keeps jobs inside the process that enqueued them. That makes goque a good fit right now for single-process applications, for tests, and for anything that runs its workers in the same binary that creates the work. It is not yet the right choice for handing jobs from a web process to a separate worker fleet. See the [Roadmap](/reference/roadmap).
+The in-memory backend keeps jobs inside the process that enqueued them, which makes it a good fit for single-process applications, for tests, and for anything that runs its workers in the same binary that creates the work. For handing jobs from a web process to a separate worker fleet, use the PostgreSQL backend — it is durable and multi-process, and its `EnqueueTx`/`EnqueueManyTx` let you enqueue inside the same transaction as the business data that justified the job. See [PostgreSQL](/reference/backends#postgresql) and the [Roadmap](/reference/roadmap).
 :::
 
 ## Where to go next

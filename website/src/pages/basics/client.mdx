@@ -56,10 +56,10 @@ client, err := goque.NewClient(memory.New(), &goque.Config{
 
 A working client is also an enqueueing client — `Enqueue` works exactly the same on both. The queues are what add the second role, not what replace the first.
 
-:::warning[Today, both roles live in one process]
-The split above describes how goque is designed to be deployed, and with the in-memory backend you cannot actually deploy it that way: the backend keeps jobs inside the process that enqueued them, so an enqueue-only client in a separate binary would hand jobs to a store nobody else can see.
+:::warning[The split needs a shared backend]
+With the in-memory backend you cannot actually deploy the split above: it keeps jobs inside the process that enqueued them, so an enqueue-only client in a separate binary would hand jobs to a store nobody else can see. Enqueue and work in the same process when memory is your backend.
 
-For now, enqueue and work in the same process. The enqueue-only shape becomes genuinely useful once a shared database backend exists — Postgres, SQLite, and Redis are designed and specced but not yet built. See the [Roadmap](/reference/roadmap).
+The PostgreSQL backend is what makes the split real: point an enqueue-only client in your web tier and a working client in your worker fleet at the same database, and both see the same jobs. SQLite and Redis remain on the [Roadmap](/reference/roadmap).
 :::
 
 ## Configuring it

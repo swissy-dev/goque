@@ -66,10 +66,11 @@ type Backend struct {
 }
 
 var _ backend.Backend = (*Backend)(nil)
+var _ backend.TxEnqueuer = (*Backend)(nil)
+var _ backend.TxCompleter = (*Backend)(nil)
 
-// New builds a Backend over d. Pass pgxv5.New for the default path. A
-// database/sql-based driver for a compatibility path that polls rather than
-// listens is planned but does not exist yet.
+// New builds a Backend over d. Use pgxv5.New with a pgx v5 pool for the
+// supported PostgreSQL integration.
 func New(d Driver, opts ...Option) (*Backend, error) {
 	if d == nil {
 		return nil, errors.New("goque/postgres: nil driver")

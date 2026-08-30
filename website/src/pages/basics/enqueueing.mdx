@@ -81,10 +81,34 @@ Two decisions in there are worth copying.
 **Decide whether a failed enqueue fails the request.** Above, the signup succeeds even if the welcome email could not be queued — losing an email is better than losing a user account. For an order confirmation you would make the opposite call and return a 500. Either is defensible; the point is that it is a decision, not a default.
 
 :::warning[Enqueue is not part of your transaction]
-`Enqueue` writes through the backend on its own. If you enqueue inside a database transaction that later rolls back, the job survives and runs against data that never existed — the classic dual-write problem.
-
-For now, enqueue *after* your transaction commits and accept that a crash in between loses the job. Transactional enqueue (`EnqueueTx`), which commits the job atomically with your business data, is designed but arrives with the database backends. See the [Roadmap](/reference/roadmap).
+`Enqueue` writes through the backend on its own. If you enqueue inside a database transaction that later rolls back, the job survives and runs against data that never existed — the classic dual-write problem. This applies to `Enqueue` and `EnqueueMany` specifically; read on for the transactional alternative.
 :::
+
+## Enqueueing inside a transaction
+
+With the PostgreSQL backend, `client.EnqueueTx` and `client.EnqueueManyTx` take a transaction you already opened, so the job commits atomically with whatever justified it. goque never calls `Begin`, `Commit`, or `Rollback` on that transaction — you own its lifecycle, and with PostgreSQL it must be a pgx v5 `pgx.Tx`:
+
+```go
+tx, err := pool.Begin(ctx)
+if err != nil {
+	return err
+}
+defer tx.Rollback(ctx)
+
+userID, err := h.users.Create(ctx, tx, req.Email)
+if err != nil {
+	return err
+}
+if _, err := h.queue.EnqueueTx(ctx, tx, SendWelcomeEmail{UserID: userID}); err != nil {
+	return err
+}
+
+return tx.Commit(ctx)
+```
+
+Roll back and the job was never created. Commit and both the user and the job are there — no outbox table, no reconciliation sweep, no window where one exists without the other.
+
+The in-memory backend does not implement this: `EnqueueTx`/`EnqueueManyTx` return an error wrapping `backend.ErrNotSupported` unless the configured backend supports transactional enqueue.
 
 Handlers built this way are also pleasant to test: assert that the handler returned fast and queued the right job, separately from asserting that the worker does the right thing. [Testing Patterns](/testing/patterns) shows that two-phase shape.
 
@@ -159,6 +183,7 @@ There are more — timeouts, attempts, retry policy, metadata, absolute scheduli
 
 ## Next steps
 
+- **[Backends](/reference/backends#postgresql)** — constructing and migrating the PostgreSQL backend that `EnqueueTx` needs.
 - **[Job Options](/configuration/options)** — every per-enqueue option and how the layers resolve.
 - **[Scheduling & Priority](/configuration/scheduling)** — delays, absolute times, and the time-boost model.
 - **[Middleware](/running/middleware)** — tagging jobs at insert, and wrapping them at execution.
